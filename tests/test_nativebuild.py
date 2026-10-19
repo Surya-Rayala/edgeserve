@@ -110,6 +110,15 @@ def test_info_reports_a_missing_runtime_and_the_fix(capsys):
     assert report["settings"]["port"] == {"value": "8000", "from": "default"}
 
 
+def test_info_still_checks_the_model_without_a_runtime(tiny_model, capsys):
+    # e.g. on a PC that only exports: the model folder is checked, the GPU parts are left out
+    assert cli.main(["info", "--model", str(tiny_model)]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["gpu_runtime"]["fix"] == "run edgeserve setup"
+    assert report["model"]["num_layers"] > 0 and report["memory_estimate_gib"]["total"] > 0
+    assert "engine_cache" not in report and "error" not in report
+
+
 def test_toolchain_changes_compare_cuda_and_tensorrt(monkeypatch):
     monkeypatch.setattr(nativebuild, "_cuda_version", lambda: "12.8")
     monkeypatch.setattr(nativebuild, "_tensorrt_version", lambda: "10.3.0.30")
@@ -246,11 +255,13 @@ def test_a_second_build_waits_for_the_first(sources):
 
 @pytest.mark.parametrize(("script", "ok"), [("echo 'fmha ok'; echo 'all ok'", True),
                                             ("echo 'xqa MISMATCH'; exit 1", False)])
-def test_the_self_test_runs_attention_check_and_records_the_result(tmp_path, script, ok):
+def test_the_self_test_runs_attention_check_and_records_the_result(tmp_path, script, ok, monkeypatch):
+    monkeypatch.setenv("EDGESERVE_API_KEY", "es-secret")  # never passed on
     root = tmp_path / "runtime"
     root.mkdir()
     checker = root / "attention-check"
-    checker.write_text(f'#!/bin/sh\n[ -n "$EDGELLM_PLUGIN_PATH" ] || exit 9\n{script}\n')
+    checker.write_text(f'#!/bin/sh\n[ -n "$EDGELLM_PLUGIN_PATH" ] || exit 9\n[ -z "$EDGESERVE_API_KEY" ] || exit 8\n'
+                       f'{script}\n')
     checker.chmod(checker.stat().st_mode | stat.S_IXUSR)
     (root / "build_info.json").write_text("{}")
     messages: list[str] = []

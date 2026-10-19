@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from edgeserve import config
+
 # Dense FP16 tensor-core FLOPs per clock per SM (FP16 accumulate), by compute capability.
 # Peak = SMs x this x max GPU clock. Matches NVIDIA's published dense figures, e.g.
 # Orin Nano Super 8 SM x 2048 x 1.02 GHz = 16.7 TFLOPS, RTX 4090 128 x 1024 x 2.52 GHz = 330 TFLOPS.
@@ -173,7 +175,7 @@ def probe_gpu(worker_binary: Path, env: dict[str, str] | None = None, timeout: f
             capture_output=True,
             encoding="utf-8",
             errors="replace",
-            env=None if env is None else {**os.environ, **env},
+            env=config.child_environment({**os.environ, **(env or {})}),  # never the API key
             timeout=timeout,
             check=False,
         )

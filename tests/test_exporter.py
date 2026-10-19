@@ -13,6 +13,8 @@ import pytest
 from conftest import make_tiny_model
 from edgeserve import cli, exporter
 
+SKIPS = ["--skip-visual", "--skip-audio"]  # passed to every export: only the language model is served
+
 
 @pytest.fixture
 def fake_exporter(tmp_path, monkeypatch) -> dict:
@@ -66,7 +68,7 @@ def test_a_local_checkpoint_becomes_a_model_folder_with_its_sampling_defaults(fa
     assert (model_dir / "config.json").is_file() and (model_dir / "model.onnx").is_file()
     assert json.loads((model_dir / "generation_config.json").read_text()) == {"temperature": 0.6, "top_p": 0.9}
     (call,) = _calls(fake_exporter)
-    assert call[0] == str(ckpt) and call[2:] == ["--externalize-weights", "lm_head"]  # FP16: only the lm_head
+    assert call[0] == str(ckpt) and call[2:] == ["--externalize-weights", "lm_head", *SKIPS]  # FP16: the lm_head
     assert not list(model_dir.parent.glob(".my-finetune.export-*"))  # the staging folder is gone
     out = capsys.readouterr().out
     assert f"Next: edgeserve serve --model {model_dir}" in out and "llama, 1 layers" in out
@@ -83,13 +85,46 @@ def test_a_local_checkpoint_becomes_a_model_folder_with_its_sampling_defaults(fa
 def test_the_big_weights_are_kept_outside_the_engine(fake_exporter, tmp_path, quant, expected):
     ckpt = _checkpoint(tmp_path / "ckpt", quantization_config=quant)
     assert cli.main(["export", str(ckpt), str(tmp_path / "out")]) == 0
-    assert _calls(fake_exporter)[0][2:] == expected
+    assert _calls(fake_exporter)[0][2:] == [*expected, *SKIPS]
+
+
+@pytest.mark.parametrize(("sidecar", "quant", "expected"), [
+    # NVIDIA ModelOpt (e.g. tensorrt-edgellm-quantize --quantization int4_awq): hf_quant_config.json next to config.json
+    ({"quantization": {"quant_algo": "W4A16_AWQ", "group_size": 128, "exclude_modules": ["lm_head"]}}, None,
+     ["--externalize-weights", "int4_ffn", "lm_head"]),
+    ({"quantization": {"quant_algo": "W4A16_AWQ", "group_size": 128}}, None, ["--externalize-weights", "int4_ffn"]),
+    ({"quantization": {"quant_algo": "FP8", "exclude_modules": ["lm_head"]}}, None, []),
+    # ... or the same inside config.json; the separate file wins, as in Edge-LLM
+    (None, {"quant_method": "modelopt", "quant_algo": "W4A16_AWQ", "ignore": ["lm_head"]},
+     ["--externalize-weights", "int4_ffn", "lm_head"]),
+    ({"quantization": {"quant_algo": "NVFP4"}}, {"quant_method": "awq", "bits": 4}, []),
+])
+def test_modelopt_int4_checkpoints_keep_their_big_weights_outside_too(fake_exporter, tmp_path, sidecar, quant,
+                                                                      expected):
+    ckpt = _checkpoint(tmp_path / "ckpt", **({"quantization_config": quant} if quant else {}))
+    if sidecar is not None:
+        (ckpt / "hf_quant_config.json").write_text(json.dumps(sidecar))
+    assert cli.main(["export", str(ckpt), str(tmp_path / "out")]) == 0
+    assert _calls(fake_exporter)[0][2:] == [*expected, *SKIPS]
+
+
+@pytest.mark.parametrize("checkpoint", ["./no-such-folder", "/no/such/folder", "~/no-such-folder", "a/b/c"])
+def test_a_missing_checkpoint_folder_is_not_looked_up_on_hugging_face(fake_exporter, tmp_path, checkpoint, capsys):
+    assert cli.main(["export", checkpoint, str(tmp_path / "out")]) == 1
+    assert "does not exist: pass your checkpoint folder" in capsys.readouterr().err
+    assert not fake_exporter["calls"].exists() or not _calls(fake_exporter)
+
+
+def test_installing_the_exporter_without_git_says_so(monkeypatch):
+    monkeypatch.setattr(exporter.shutil, "which", lambda name: None)
+    with pytest.raises(exporter.ExportError, match=r"needs git.*sudo apt install git"):
+        exporter.ensure(progress=lambda text: None)
 
 
 def test_moe_and_pruned_checkpoints_are_described(tmp_path):
     hf = {"quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 128}, "num_experts": 8,
           "intermediate_sizes": [4352, 14336]}
-    assert exporter.export_options(hf, []) == ["--externalize-weights", "int4_ffn", "int4_moe", "lm_head"]
+    assert exporter.export_options(hf, []) == ["--externalize-weights", "int4_ffn", "int4_moe", "lm_head", *SKIPS]
     notes = exporter.describe(hf)
     assert any("INT4 GPTQ" in n for n in notes) and any("per-layer MLP widths 4352-14336" in n for n in notes)
 
@@ -98,7 +133,9 @@ def test_options_after_a_double_dash_reach_the_exporter_unchanged(fake_exporter,
     ckpt = _checkpoint(tmp_path / "ckpt", quantization_config={"quant_method": "awq", "bits": 4})
     assert cli.main(["export", str(ckpt), str(tmp_path / "out"), "--", "--reduced-vocab-dir", "/v",
                      "--externalize-weights", "all"]) == 0
-    assert _calls(fake_exporter)[0][2:] == ["--reduced-vocab-dir", "/v", "--externalize-weights", "all"]
+    assert _calls(fake_exporter)[0][2:] == ["--reduced-vocab-dir", "/v", "--externalize-weights", "all", *SKIPS]
+    assert exporter.export_options({}, ["--skip-visual"]) == ["--externalize-weights", "lm_head", "--skip-visual",
+                                                              "--skip-audio"]  # not given twice
 
 
 def test_a_multimodal_export_keeps_only_the_language_model(fake_exporter, tmp_path, monkeypatch, capsys):

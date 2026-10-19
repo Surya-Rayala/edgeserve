@@ -396,7 +396,7 @@ def test_edgellm_version_is_reported_not_checked(tmp_path: Path) -> None:
 def test_fields_the_runtime_requires_have_no_defaults(tmp_path: Path, key: str) -> None:
     # The Edge-LLM runtime / builder read these without a default, so a folder lacking one cannot be served:
     # report it now instead of after a long engine build.
-    with pytest.raises(ModelError, match=rf"config\.json has no {key}\b.*re-export"):
+    with pytest.raises(ModelError, match=rf"config\.json has no {key}\b.*export the model again with edgeserve export"):
         load_model(make_model(tmp_path / "m", config={key: DROP}))
 
 
@@ -528,6 +528,34 @@ def test_path_must_be_an_existing_directory(model_dir: Path, tmp_path: Path) -> 
         load_model(tmp_path / "nope")
     with pytest.raises(ModelError, match="not a directory"):
         load_model(model_dir / "config.json")
+
+
+def test_hugging_face_checkpoint_is_sent_to_edgeserve_export(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "ckpt"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps({"model_type": "llama", "architectures": ["LlamaForCausalLM"]}))
+    (checkpoint / "model.safetensors").write_bytes(b"")
+    with pytest.raises(ModelError, match=r"is a Hugging Face checkpoint, not an exported model.*edgeserve export"):
+        load_model(checkpoint)
+
+
+def test_another_tools_onnx_model_is_explained(tmp_path: Path) -> None:
+    # e.g. an Optimum export: an ONNX graph next to the Hugging Face config, without Edge-LLM's files
+    folder = tmp_path / "onnx"
+    folder.mkdir()
+    (folder / "config.json").write_text(json.dumps({"model_type": "qwen2"}))
+    (folder / "model.onnx").write_bytes(b"")
+    with pytest.raises(ModelError, match=r"ONNX model made by another tool.*edgeserve export"):
+        load_model(folder)
+
+
+def test_gguf_is_explained(tmp_path: Path) -> None:
+    gguf = tmp_path / "model-q4_k_m.gguf"
+    gguf.write_bytes(b"GGUF")
+    with pytest.raises(ModelError, match=r"is a GGUF file.*edgeserve export"):
+        load_model(gguf)
+    with pytest.raises(ModelError, match=r"holds GGUF files.*edgeserve export"):
+        load_model(tmp_path)
 
 
 def test_export_root_hints_at_llm_subfolder(tmp_path: Path) -> None:

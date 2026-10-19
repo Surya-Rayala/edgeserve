@@ -20,7 +20,8 @@ browser needs internet access).
 "API key: yes" applies only when the server has one (`EDGESERVE_API_KEY`). It is sent as
 `Authorization: Bearer <key>`. The GET endpoints also answer HEAD.
 
-`GET /v1/models` returns the served model with its limits:
+`GET /v1/models` returns the served model with its limits (they appear once the engine is built;
+until then the entry has only the name and `ready: false`):
 
 ```json
 {"object": "list", "data": [{"id": "qwen2.5-0.5b-instruct-awq", "object": "model", "created": 1792432212,
@@ -52,35 +53,46 @@ token is added if the model has one and the text does not start with it.
 | `messages` | roles `system`, `developer` (treated as system), `user`, `assistant`. `content` is a string or a list of `{"type": "text", "text": ...}` parts. Up to 64 messages of up to 128 KB each. A message `name` is accepted and ignored | — |
 | `prompt` | one string | — |
 | `max_tokens` / `max_completion_tokens` | ≥ 1; prompt + `max_tokens` + 1 must fit the engine's context | `--max-new-tokens` (the model's `generation_config.json`, else 512) |
-| `temperature`, `top_p`, `top_k` | `temperature` 0 is greedy decoding. Otherwise `top_p` and `top_k` come from the request, else from the model's `generation_config.json` (unless it is greedy, `do_sample: false`), else no limit. `top_k` ≤ 1024; 0, or the vocabulary size or more, means no limit | the model's `generation_config.json`, else greedy |
+| `temperature`, `top_p`, `top_k` | `temperature` 0–2; 0 is greedy decoding. `top_p` above 0, up to 1. `top_k` ≤ 1024; 0, or the vocabulary size or more, means no limit. When sampling, `top_p` and `top_k` come from the request, else from the model's `generation_config.json` (unless it is greedy, `do_sample: false`), else no limit | the model's `generation_config.json`, else greedy |
 | `seed` | integer, for reproducible sampling | a new random seed per sampled request, saved in its record (`request.params.seed`) so the output can be reproduced |
 | `stop` | a string or up to 4 strings | none |
 | `stream`, `stream_options.include_usage` | Server-Sent Events, with an optional final chunk carrying usage and metrics (`stream_options` only with `stream: true`) | false |
-| `metadata` | up to 16 string key/value pairs, saved in the record | none |
+| `metadata` | up to 16 string key/value pairs (keys up to 64 characters, values up to 512), saved in the record | none |
 | `request_id` | your ID (the same as the `X-Request-Id` header) | generated |
-| `return_record` | true: include the full record (with per-token data) in the response; not with `stream` | false |
+| `return_record` | true: add the full record (with per-token data) to the response as `record`; not with `stream` | false |
 | `model` | optional; if given, it must be the served model's name | — |
 
 **Limits:**
 
-- The prompt: at most `--max-input-len` tokens (default 3072).
+- The prompt, counted after the chat template (as in `usage.prompt_tokens`): at most
+  `--max-input-len` tokens (default 3072).
 - Prompt + output + 1: at most the engine's context, `--max-input-len` + `--max-new-tokens` + 1
   rounded up to 128 (3712 by default). So a short prompt can ask for more than `--max-new-tokens`.
 - The body: at most 4 MiB.
-- `n` must be 1.
 
 **Not supported**, so rejected with HTTP 400 (never silently ignored): images and audio,
-tools and function calling, `response_format`, `logprobs`, `n` > 1, `echo`, and penalties other
-than 0. A `null` for one of these means "not used" and is accepted (some clients send every field).
+tools and function calling, `response_format`, `logprobs`, `n` > 1, `echo`, penalties other
+than 0, and any other field not in the table above (`unsupported_parameter`). A `null` for an
+unsupported OpenAI field means "not used" and is accepted (some clients send every field). `user`,
+`safety_identifier` and `prompt_cache_key` are accepted and ignored.
+
+**Sampling defaults** come from the model's `generation_config.json`: the server uses its
+`do_sample`, `temperature`, `top_p`, `top_k` and `max_new_tokens`, and a request's own values win
+(its end-of-sequence tokens are taken in at export). The file's `max_new_tokens` also sizes the
+engine's context, and with it the KV cache memory, unless the server is started with
+`--max-new-tokens`. Edge-LLM has no repetition, presence or frequency penalties, beam search or
+minimum length: when the file sets one, the server log says so at startup, as answers can then
+differ from Hugging Face transformers.
 
 ## Responses
 
 Responses are the standard OpenAI objects, with two extra fields:
 
 - `request_id`: your ID.
-- `metrics`: a summary. Time to first token (`ttft_ms`), time per output token (`tpot_ms`),
-  inter-token latency percentiles, `decode_tokens_per_s`, compute and bandwidth utilisation
-  (`prefill_mfu`, `decode_mbu`), and `energy_j`.
+- `metrics`: a summary of the record: `queue_ms`, `prefill_ms`, `ttft_ms`, `decode_ms`, `e2e_ms`,
+  `tpot_ms`, `itl_p50_ms`, `itl_p99_ms`, `prefill_tokens_per_s`, `decode_tokens_per_s`,
+  `prefill_mfu`, `decode_mbu`, `energy_j`, `energy_per_output_token_mj`, `avg_power_w` and
+  `batch_size` (definitions: [METRICS.md](METRICS.md)).
 
 ```json
 {"id": "chatcmpl-demo-001", "object": "chat.completion", "model": "qwen2.5-0.5b-instruct-awq",
@@ -97,6 +109,9 @@ Responses are the standard OpenAI objects, with two extra fields:
   so the first chunk can come a token or two after `ttft_ms`.
 - With `include_usage`, a final chunk carries `usage` and `metrics`. Then comes `data: [DONE]`.
 - The streamed text always adds up to the final text, in whole UTF-8 characters.
+- An error after the stream has started (the engine failed, the worker crashed, 10 minutes in the
+  queue, shutdown) arrives as a `data: {"error": {…}}` event, then `data: [DONE]`. The HTTP status
+  is already 200 and there is no `Retry-After`. The OpenAI SDK raises it as an `APIError`.
 
 A client that disconnects cancels its generation at the next token. The request is recorded as
 `cancelled` (HTTP 499, code `client_disconnected`).
@@ -118,6 +133,7 @@ Errors use OpenAI's format, `{"error": {"message", "type", "param", "code"}}`:
 | 503 | `server_unavailable`, `server_is_overloaded`, `low_memory`, `worker_restarted`, `queue_timeout`, `server_shutting_down` | not ready yet; queue full (16 waiting); memory low; the GPU worker crashed and is restarting; waited 10 minutes in the queue; shutting down. All with `Retry-After`; safe to retry |
 | 500 | `engine_error` | generation failed in the engine |
 
+One client address can hold at most 32 connections; more are dropped at once, without a response.
 While all 128 connections are taken, every request (`/health` included) gets a plain-text 503.
 
 ## Request IDs
@@ -154,11 +170,11 @@ saved as `records/doc-000123.json`. It can be fetched from any machine with
 
 | Rule | Behaviour |
 |---|---|
-| format | 1–512 printable ASCII characters, no leading or trailing space. Letters, digits, `.`, `_` and `-` are recommended: other characters are percent-encoded in file names, and an encoded name over 200 characters is shortened (its first 183 characters, `-`, and 16 hex digits of its SHA-256). `GET /v1/records/<id>` still finds it |
+| format | 1–512 printable ASCII characters, no leading or trailing space. With up to 200 letters, digits, `.`, `_` and `-` (not a leading `.`), the file name is the ID itself; other IDs are percent-encoded and, if long, shortened with a hash. `GET /v1/records/<id>` finds it either way |
 | no ID given | the server creates `req_<hex>` and returns it |
 | the header and the body disagree, or there are two `X-Request-Id` headers | 400 |
 | the same ID while it is still running | 409 |
-| the same ID later | runs again: `records/<id>.json` holds the latest attempt; `results.jsonl` keeps every attempt, each with its own `attempt_id` |
+| the same ID later | runs again: `records/<id>.json` holds the latest attempt; `results.jsonl` keeps every attempt, each line with its own `id` (the record's `attempt_id`) |
 
 ## Records
 
@@ -169,6 +185,9 @@ DIR/records/<id>.json   one file per ID: the request, the output text and token 
                         per-request metrics, per-token arrays, the model, engine and system
 DIR/results.jsonl       one line per attempt (OpenAI Batch output format)
 ```
+
+A request refused before it is queued (for example a 400, a 409 or a full queue) gets no record
+and no `results.jsonl` line.
 
 A record, abridged:
 
@@ -187,8 +206,6 @@ A record, abridged:
            "energy_mj": […], "kv_usage": […], "device_free_bytes": […]}}
 ```
 
-`steps` has one entry per generated token; entry 0 is the prefill. Timing comes from Edge-LLM's
-per-token callback and its CUDA-event step timers. FLOPs and bytes come from the model's own
-tensor shapes. Energy comes from the Jetson power sensor, or NVML on other GPUs. The record folder
-is readable only by the user running the server (`records/` 0700, files 0600). Every field and
-formula, and the Prometheus metrics: [METRICS.md](METRICS.md).
+`steps` has one entry per generated token; entry 0 is the prefill (the pass over the prompt). The
+record folder is readable only by the user running the server (`records/` 0700, files 0600). Every
+field, how it is measured, and the Prometheus metrics: [METRICS.md](METRICS.md).

@@ -168,8 +168,7 @@ def build(progress: Callable[[str], None] = print) -> Path:
         else:
             progress(f"building the GPU runtime in {root} (log: {log_path}); this takes about 30 minutes on a Jetson "
                      "Orin Nano, less on a PC")
-        env = dict(os.environ, EDGESERVE_SOURCES=str(sources), EDGESERVE_BUILD_ROOT=str(root))
-        env.pop("EDGESERVE_API_KEY", None)
+        env = config.child_environment(EDGESERVE_SOURCES=str(sources), EDGESERVE_BUILD_ROOT=str(root))
         code = run_logged(["bash", str(sources / "build.sh")], env, log_path)
         if code != 0:
             raise NativeBuildError(f"the GPU runtime build failed (exit {code}); the last lines are above and the "
@@ -277,7 +276,8 @@ def self_test(root: Path, progress: Callable[[str], None] = print) -> bool:
     started = time.monotonic()
     try:
         result = subprocess.run([str(checker)], capture_output=True, text=True, timeout=1800,
-                                env=dict(os.environ, EDGELLM_PLUGIN_PATH=str(root / "libNvInfer_edgellm_plugin.so")))
+                                env=config.child_environment(
+                                    EDGELLM_PLUGIN_PATH=str(root / "libNvInfer_edgellm_plugin.so")))
         output, ok = result.stdout + result.stderr, result.returncode == 0 and "all ok" in result.stdout
     except (OSError, subprocess.TimeoutExpired) as e:
         output, ok = str(e), False

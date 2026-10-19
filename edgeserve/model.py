@@ -170,8 +170,9 @@ _EMBEDDING = "embedding.safetensors"
 _VOCAB_MAP = "vocab_map.safetensors"
 _CHAT_TEMPLATE = "chat_template.jinja"
 _GENERATION_CONFIG = "generation_config.json"
-_EXPORT_HINT = "the 'llm' folder written by tensorrt-edgellm-export"
-_REEXPORT_HINT = "re-export the model with tensorrt-edgellm-export"
+_EXPORT_HINT = "a model folder made by edgeserve export (or the llm folder of a TensorRT Edge-LLM export)"
+_REEXPORT_HINT = "export the model again with edgeserve export"
+_SERVE_EXPORT = "export it with edgeserve export <checkpoint> <model-dir> and serve <model-dir>"
 
 # Bytes per element for the kv_cache_dtype values the Edge-LLM runtime accepts.
 _KV_DTYPE_BYTES: dict[str, int] = {"fp16": 2, "bf16": 2, "fp8": 1, "int8": 1, "fp32": 4}
@@ -204,10 +205,16 @@ def _read_config(root: Path) -> dict:
     if not root.exists():
         raise ModelError(f"model folder {root} does not exist")
     if not root.is_dir():
+        if root.suffix.lower() == ".gguf":
+            raise ModelError(f"{root} is a GGUF file, which edgeserve cannot serve; take the Hugging Face checkpoint "
+                             f"the model was made from and {_SERVE_EXPORT}")
         hint = f" (did you mean its folder {root.parent}?)" if root.suffix in (".json", ".onnx") else ""
         raise ModelError(f"{root} is not a directory{hint}; pass {_EXPORT_HINT}")
     config_path = root / "config.json"
     if not config_path.is_file():
+        if any(root.glob("*.gguf")):
+            raise ModelError(f"{root} holds GGUF files, which edgeserve cannot serve; take the Hugging Face "
+                             f"checkpoint the model was made from and {_SERVE_EXPORT}")
         nested = root / "llm"
         hint = f" ({nested} has one: did you mean that folder?)" if (nested / "config.json").is_file() else ""
         raise ModelError(
@@ -215,6 +222,23 @@ def _read_config(root: Path) -> dict:
             "(it contains config.json and model.onnx)"
         )
     return _read_json_object(config_path, "copy it again from the export")
+
+
+def _check_not_checkpoint(root: Path, config: dict) -> None:
+    """Explain a Hugging Face checkpoint, or another tool's ONNX model, passed where an Edge-LLM export belongs:
+    their config.json is a Hugging Face config (model_type), while an Edge-LLM export names the architecture
+    as ``model``."""
+    if "model" in config or "model_type" not in config:
+        return
+    if (root / "model.onnx").is_file():
+        raise ModelError(
+            f"{root} holds an ONNX model made by another tool (its config.json is a Hugging Face config), not a "
+            f"TensorRT Edge-LLM export; take the original Hugging Face checkpoint and {_SERVE_EXPORT}"
+        )
+    raise ModelError(
+        f"{root} is a Hugging Face checkpoint, not an exported model; export it first: "
+        f"edgeserve export {root} <model-dir>, then serve <model-dir>"
+    )
 
 
 def _check_engine_kind(root: Path, config: dict) -> None:
@@ -236,7 +260,7 @@ def _check_required_files(root: Path) -> None:
     missing = [f"{name} ({what})" for name, what in _REQUIRED_FILES.items() if not (root / name).is_file()]
     if missing:
         raise ModelError(
-            f"{root} is missing {', '.join(missing)}; copy the complete folder written by tensorrt-edgellm-export "
+            f"{root} is missing {', '.join(missing)}; copy the complete exported folder, or {_REEXPORT_HINT} "
             "(tokenizer files can also be copied from the original Hugging Face model)"
         )
 
@@ -274,7 +298,7 @@ def _external_weight_files(root: Path, config: dict) -> list[_ExternalWeights]:
     if missing:
         raise ModelError(
             f"{root} is missing {', '.join(missing)}, listed in config.json external_weight_files; copy it from the "
-            "export folder (tensorrt-edgellm-export --externalize-weights writes it next to model.onnx)"
+            "exported folder (the export writes it next to model.onnx)"
         )
     return entries
 
@@ -897,6 +921,7 @@ def load_model(path: Path) -> ModelInfo:
 
 def _load_folder(root: Path) -> ModelInfo:
     config = _read_config(root)
+    _check_not_checkpoint(root, config)
     _check_engine_kind(root, config)
     _check_required_files(root)
     external = _external_weight_files(root, config)
@@ -906,8 +931,7 @@ def _load_folder(root: Path) -> ModelInfo:
     model_type = config.get("model")
     if not isinstance(model_type, str) or not model_type.strip():
         raise ModelError(
-            f"config.json has no 'model' architecture name (found {model_type!r}); re-export the model with "
-            "tensorrt-edgellm-export"
+            f"config.json has no 'model' architecture name (found {model_type!r}); {_REEXPORT_HINT}"
         )
     num_layers = _config_int(config, "num_hidden_layers")
     hidden_size = _config_int(config, "hidden_size")

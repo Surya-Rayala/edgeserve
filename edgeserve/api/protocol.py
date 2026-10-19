@@ -74,7 +74,8 @@ class StreamOptions(BaseModel):
 _UNSUPPORTED_NULLABLE = frozenset({
     "tools", "tool_choice", "parallel_tool_calls", "functions", "function_call", "response_format",
     "logit_bias", "top_logprobs", "modalities", "audio", "prediction", "reasoning_effort", "service_tier",
-    "store", "web_search_options", "suffix", "best_of",
+    "store", "web_search_options", "suffix", "best_of", "verbosity", "moderation", "prompt_cache_options",
+    "prompt_cache_retention",
 })
 
 
@@ -92,7 +93,9 @@ class _GenerationParams(BaseModel):
     n: int | None = Field(1, ge=1, le=1)  # OpenAI allows null for n, stream and echo (= the default)
     stream: bool = False
     stream_options: StreamOptions | None = None
-    user: str | None = None
+    user: str | None = None  # an end-user ID (OpenAI: abuse monitoring), accepted and ignored, as are its successors:
+    safety_identifier: str | None = None
+    prompt_cache_key: str | None = None  # a prompt-caching hint
     metadata: dict[str, str] | None = None
     frequency_penalty: float | None = Field(None, ge=0, le=0)
     presence_penalty: float | None = Field(None, ge=0, le=0)

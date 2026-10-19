@@ -817,6 +817,15 @@ def test_probe_gpu_returns_the_probe_event(tmp_path: Path) -> None:
     assert probe_gpu(worker) == ORIN_PROBE
 
 
+def test_probe_gpu_never_passes_the_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = fake_worker(tmp_path, """printf '{"ev":"probe","key":"%s","tls":"%s"}\\n' "${EDGESERVE_API_KEY:-none}" \
+"${EDGESERVE_TLS_KEY:-none}" """)
+    monkeypatch.setenv("EDGESERVE_API_KEY", "es-secret")
+    monkeypatch.setenv("EDGESERVE_TLS_KEY", "/keys/server.key")
+    for env in (None, {"EDGELLM_PLUGIN_PATH": "x.so"}, {"EDGESERVE_API_KEY": "es-secret"}):
+        assert probe_gpu(worker, env=env) == {"ev": "probe", "key": "none", "tls": "none"}
+
+
 def test_probe_gpu_env_extends_the_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     worker = fake_worker(
         tmp_path, """printf '{"ev":"probe","var":"%s","path":"%s"}\\n' "$EDGESERVE_TEST_VAR" "${PATH:+set}" """

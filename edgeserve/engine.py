@@ -30,6 +30,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from edgeserve import config
 from edgeserve.model import ModelInfo
 
 log = logging.getLogger("edgeserve.engine")
@@ -93,8 +94,7 @@ class NativeBuild:
 
     def env(self) -> dict[str, str]:
         """Environment for Edge-LLM processes: the plugin by absolute path, TensorRT's libraries found, no secrets."""
-        env = {k: v for k, v in os.environ.items() if k not in ("EDGESERVE_API_KEY", "EDGESERVE_TLS_KEY")}
-        env["EDGELLM_PLUGIN_PATH"] = str(self.plugin)
+        env = config.child_environment(EDGELLM_PLUGIN_PATH=str(self.plugin))
         lib_dir = self.info.get("trt_lib_dir")
         if isinstance(lib_dir, str) and lib_dir and lib_dir not in _SYSTEM_LIB_DIRS:
             # a TensorRT tarball: its libraries are not on the loader's default path (under systemd)

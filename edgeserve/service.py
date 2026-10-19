@@ -368,8 +368,8 @@ def check_compatibility(model: ModelInfo, gpu: dict) -> None:
     if exported and runtime and exported.split(".")[:2] != runtime.split(".")[:2]:
         raise StartupError(
             f"{model.name} was exported with TensorRT Edge-LLM {exported}, but this server runs Edge-LLM {runtime}. "
-            "Exports only work with the Edge-LLM version that produced them: re-export the model with "
-            f"Edge-LLM {runtime} (see README, 'Export a model')."
+            "Exports only work with the Edge-LLM version that produced them: export the model again with "
+            "edgeserve export (see README, 'Export a model')."
         )
     if not model.has_chat_template:
         raise StartupError(

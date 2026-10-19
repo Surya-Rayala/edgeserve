@@ -3,7 +3,7 @@
 The checkpoint is a Hugging Face model ID or a local folder: an original model, a fine-tuned or
 pruned one, or one quantized to INT4 with AWQ or GPTQ. TensorRT Edge-LLM's exporter does the work.
 It is installed on first use into ``~/.local/share/edgeserve/exporter/`` (its own virtual
-environment, about 5 GB with PyTorch), at the Edge-LLM commit edgeserve's GPU runtime is built
+environment, about 5.5 GB with PyTorch), at the Edge-LLM commit edgeserve's GPU runtime is built
 from, with edgeserve's exporter patches (``edgeserve/export_patches``: per-layer MLP widths for
 pruned checkpoints). Exporting runs on the CPU and needs no GPU or ``edgeserve setup``.
 
@@ -32,6 +32,9 @@ EDGELLM_REPO = "https://github.com/NVIDIA/TensorRT-Edge-LLM.git"
 # The exporter's wheel ships this submodule's licence; the C++ submodules are not needed to export.
 _SUBMODULES = ("3rdParty/nlohmannJson",)
 _INT4_METHODS = ("awq", "gptq")
+# edgeserve serves the language model only: the image and audio encoders of a multimodal checkpoint are not exported
+# (exporting them can need more, such as ModelOpt for Qwen3.5's vision encoder)
+_SKIP_PARTS = ("--skip-visual", "--skip-audio")
 
 
 class ExportError(RuntimeError):
@@ -77,10 +80,12 @@ def ensure(progress: Callable[[str], None] = print) -> Exporter:
     with nativebuild.file_lock(root / ".lock", progress, "another edgeserve export is installing the exporter"):
         if _installed_key(root) == key and found.export.exists():
             return found
-        progress(f"installing TensorRT Edge-LLM's exporter in {root} (once: a few minutes, about 5 GB)")
+        if shutil.which("git") is None:
+            raise ExportError("installing the exporter needs git: install it (sudo apt install git), then run the "
+                              "command again")
+        progress(f"installing TensorRT Edge-LLM's exporter in {root} (once: a few minutes, about 5.5 GB)")
         log_path = root / "install.log"
-        env = dict(os.environ)
-        env.pop("EDGESERVE_API_KEY", None)
+        env = config.child_environment()
         src = root / "src"
         commit = nativebuild.edgellm_commit()
         if not (src / ".git").is_dir():  # an interrupted clone is started again
@@ -137,14 +142,19 @@ def export(checkpoint: str, model_dir: Path, extra: list[str] | None = None,
     if model_dir.exists() and (not model_dir.is_dir() or any(model_dir.iterdir())):
         raise ExportError(f"{model_dir} already exists and is not empty: choose a new folder, or delete it first")
     local = Path(checkpoint).expanduser()
+    if not local.exists() and (checkpoint.startswith(("/", ".", "~")) or checkpoint.count("/") > 1):
+        raise ExportError(f"{local} does not exist: pass your checkpoint folder, or a Hugging Face model ID such as "
+                          "Qwen/Qwen2.5-0.5B-Instruct-AWQ")  # a path, not an ID: do not look it up on Hugging Face
     source = str(local.absolute()) if local.is_dir() else checkpoint
     if local.is_dir() and not (local / "config.json").is_file():
         raise ExportError(f"{local} has no config.json, so it is not a Hugging Face checkpoint folder (see "
                           "docs/EXPORT.md, 'Your own checkpoints')")
     exporter = ensure(progress)
     hf_config = _json(_checkpoint_file(exporter, source, "config.json", required=True))
-    options = export_options(hf_config, extra or [])
-    for note in describe(hf_config):
+    sidecar_path = _checkpoint_file(exporter, source, "hf_quant_config.json", required=False)
+    sidecar = _json(sidecar_path) if sidecar_path is not None else None  # NVIDIA ModelOpt's quantization file
+    options = export_options(hf_config, extra or [], sidecar)
+    for note in describe(hf_config, sidecar):
         progress(note)
 
     model_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -155,8 +165,7 @@ def export(checkpoint: str, model_dir: Path, extra: list[str] | None = None,
     log_path = log_dir / f"{model_dir.name}.log"
     log_path.unlink(missing_ok=True)
     progress(f"exporting {checkpoint} (log: {log_path}); this takes a few minutes")
-    env = dict(os.environ)
-    env.pop("EDGESERVE_API_KEY", None)
+    env = config.child_environment()
     try:
         code = nativebuild.run_logged([str(exporter.export), source, str(partial), *options], env, log_path)
         if code != 0:
@@ -185,30 +194,52 @@ def export(checkpoint: str, model_dir: Path, extra: list[str] | None = None,
     return model_dir
 
 
-def export_options(hf_config: dict, extra: list[str]) -> list[str]:
+def export_options(hf_config: dict, extra: list[str], sidecar: dict | None = None) -> list[str]:
     """Exporter options for this checkpoint, unless the caller chose --externalize-weights itself.
 
     The weights that dominate the engine build's memory are kept outside the engine, where the runtime loads
     them as they are: INT4 feed-forward weights (as Edge-LLM recommends for Jetson) and an FP16 output layer
     (lm_head). TensorRT holds the weights it builds with several times, so this is what lets INT4 models with
-    large vocabularies build on an 8 GB Jetson; decoding speed is the same.
+    large vocabularies build on an 8 GB Jetson; decoding speed is the same. The image and audio encoders of
+    multimodal checkpoints are skipped (_SKIP_PARTS).
     """
+    skips = [flag for flag in _SKIP_PARTS if flag not in extra]
     if any(option.startswith("--externalize-weights") for option in extra):
-        return list(extra)
+        return [*extra, *skips]
     kinds = []
-    if is_int4(hf_config):
+    if is_int4(hf_config, sidecar):
         kinds.append("int4_ffn")
         text = hf_config.get("text_config") if isinstance(hf_config.get("text_config"), dict) else hf_config
         if any(int(text.get(key) or 0) > 0 for key in ("num_experts", "n_routed_experts", "num_local_experts")):
             kinds.append("int4_moe")
-    if fp16_lm_head(hf_config):
+    if fp16_lm_head(hf_config, sidecar):
         kinds.append("lm_head")
-    return ["--externalize-weights", *kinds, *extra] if kinds else list(extra)
+    return [*(["--externalize-weights", *kinds] if kinds else []), *extra, *skips]
 
 
-def fp16_lm_head(hf_config: dict) -> bool:
-    """Whether the checkpoint's output layer is unquantized: an FP16/BF16 checkpoint, or INT4 AWQ / GPTQ that left
-    lm_head alone (Edge-LLM can keep only an unquantized lm_head outside the engine)."""
+def _modelopt(hf_config: dict, sidecar: dict | None) -> tuple[str, list[str], dict]:
+    """An NVIDIA ModelOpt checkpoint's quant_algo (upper case), excluded modules and settings, read the way Edge-LLM
+    reads them: from hf_quant_config.json when there is one, else from a quantization_config that has quant_algo.
+    ("", [], {}) for other checkpoints."""
+    if isinstance(sidecar, dict):
+        quant = sidecar.get("quantization") if isinstance(sidecar.get("quantization"), dict) else {}
+        excluded = quant.get("exclude_modules")
+    else:
+        quant = hf_config.get("quantization_config")
+        if not isinstance(quant, dict) or "quant_algo" not in quant:
+            return "", [], {}
+        excluded = quant.get("ignore", quant.get("exclude_modules"))
+    names = [str(name) for name in excluded] if isinstance(excluded, list) else []
+    return str(quant.get("quant_algo") or "").upper(), names, quant
+
+
+def fp16_lm_head(hf_config: dict, sidecar: dict | None = None) -> bool:
+    """Whether the checkpoint's output layer is unquantized (Edge-LLM can keep only an unquantized lm_head outside
+    the engine): an FP16/BF16 checkpoint, INT4 AWQ / GPTQ that left lm_head alone, or ModelOpt INT4 AWQ that lists
+    lm_head among its excluded modules."""
+    algo, excluded, _ = _modelopt(hf_config, sidecar)
+    if algo:
+        return is_int4(hf_config, sidecar) and any("lm_head" in name for name in excluded)
     quant = hf_config.get("quantization_config")
     if not isinstance(quant, dict):
         return True
@@ -217,18 +248,26 @@ def fp16_lm_head(hf_config: dict) -> bool:
     return not bool(quant.get("lm_head", False))
 
 
-def is_int4(hf_config: dict) -> bool:
+def is_int4(hf_config: dict, sidecar: dict | None = None) -> bool:
+    """INT4 weight-only: the AutoAWQ or GPTQ format (quant_method), or ModelOpt's W4A16 AWQ (quant_algo)."""
+    algo, _, _ = _modelopt(hf_config, sidecar)
+    if algo:
+        return "W4A16" in algo and "AWQ" in algo
     quant = hf_config.get("quantization_config")
     if not isinstance(quant, dict):
         return False
     return str(quant.get("quant_method", "")).lower() in _INT4_METHODS and int(quant.get("bits", 4) or 4) == 4
 
 
-def describe(hf_config: dict) -> list[str]:
+def describe(hf_config: dict, sidecar: dict | None = None) -> list[str]:
     """What the export will treat specially, in words."""
     text = hf_config.get("text_config") if isinstance(hf_config.get("text_config"), dict) else hf_config
     notes = []
-    if is_int4(hf_config):
+    algo, _, modelopt = _modelopt(hf_config, sidecar)
+    if algo and is_int4(hf_config, sidecar):
+        notes.append(f"INT4 AWQ checkpoint made with NVIDIA ModelOpt (group size {modelopt.get('group_size', 128)}): "
+                     "its feed-forward weights are kept outside the engine")
+    elif is_int4(hf_config):
         quant = hf_config["quantization_config"]
         zeros = "symmetric" if quant.get("sym") else "asymmetric zero points, kept exact"
         notes.append(f"INT4 {quant.get('quant_method', '').upper()} checkpoint (group size "

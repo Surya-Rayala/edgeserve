@@ -172,11 +172,18 @@ def test_a_greedy_generation_config_does_not_turn_requested_sampling_back_into_g
 
 
 @pytest.mark.parametrize("field", ["tools", "tool_choice", "response_format", "functions", "logit_bias",
-                                   "top_logprobs", "parallel_tool_calls"])
+                                   "top_logprobs", "parallel_tool_calls", "verbosity", "moderation",
+                                   "prompt_cache_options", "prompt_cache_retention"])
 def test_explicit_null_for_an_unsupported_feature_means_not_used(field):
     assert ChatCompletionRequest.model_validate({"messages": USER, field: None})  # some clients send every field
     error = chat_error({"messages": USER, field: [] if field != "parallel_tool_calls" else True})
     assert error.code == "unsupported_parameter" and error.param == field
+
+
+def test_end_user_ids_and_cache_keys_are_accepted_and_ignored():
+    for field in ("user", "safety_identifier", "prompt_cache_key"):
+        assert ChatCompletionRequest.model_validate({"messages": USER, field: "u-123"})
+        assert ChatCompletionRequest.model_validate({"messages": USER, field: None})
 
 
 def test_explicit_null_for_an_unsupported_message_field_means_not_used():

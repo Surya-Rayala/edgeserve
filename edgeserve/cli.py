@@ -397,10 +397,10 @@ def _build(settings: cfg.Settings) -> int:
 
 def _info(args: argparse.Namespace) -> int:
     from edgeserve import nativebuild
-    from edgeserve.engine import BuildProfile, EngineCache, NativeBuild, engine_key
+    from edgeserve.engine import EngineCache, NativeBuild, engine_key
     from edgeserve.hardware import probe, probe_gpu
-    from edgeserve.model import estimate_memory, fingerprint, load_model
-    from edgeserve.service import available_memory, check_compatibility, check_runtime, default_max_new_tokens
+    from edgeserve.model import fingerprint
+    from edgeserve.service import available_memory, check_compatibility, check_runtime
 
     gib = 2**30
     report: dict = {"edgeserve": _version(), "settings_file": str(config.config_file())}
@@ -431,6 +431,8 @@ def _info(args: argparse.Namespace) -> int:
                                      "path": str(state.root) if state.root else None}
             if not state.ok:
                 report["gpu_runtime"]["fix"] = "run edgeserve setup"
+                if resolved["model"][0] is not None:  # the model is still checked, e.g. on a PC that only exports
+                    _report_model(report, args)
                 print(json.dumps(report, indent=2))
                 return 1
             native = NativeBuild.locate(config.native_current())
@@ -449,14 +451,7 @@ def _info(args: argparse.Namespace) -> int:
             report["note"] = "pass --model <folder> (or set EDGESERVE_MODEL) for model, memory and engine facts"
             print(json.dumps(report, indent=2))
             return 0
-        settings = cfg.from_args(args)
-        model = load_model(settings.model)
-        report["model"] = model.as_dict()
-        profile = BuildProfile(settings.max_batch_size, settings.max_input_len, default_max_new_tokens(settings, model))
-        estimate = estimate_memory(model, profile.max_batch_size, profile.kv_capacity, profile.max_input_len)
-        report["memory_estimate_gib"] = {k: round(v / gib, 2) for k, v in estimate.items()}
-        report["engine_profile"] = {"max_batch_size": profile.max_batch_size, "max_input_len": profile.max_input_len,
-                                    "max_new_tokens": profile.max_new_tokens, "kv_capacity": profile.kv_capacity}
+        settings, model, profile = _report_model(report, args)
         try:
             check_compatibility(model, gpu)
             report["compatible"] = True
@@ -475,6 +470,23 @@ def _info(args: argparse.Namespace) -> int:
         return 1
     print(json.dumps(report, indent=2))
     return 0
+
+
+def _report_model(report: dict, args: argparse.Namespace):
+    """Add the model, its memory estimate and its engine limits to an info report (no GPU needed)."""
+    from edgeserve.engine import BuildProfile
+    from edgeserve.model import estimate_memory, load_model
+    from edgeserve.service import default_max_new_tokens
+
+    settings = cfg.from_args(args)
+    model = load_model(settings.model)
+    report["model"] = model.as_dict()
+    profile = BuildProfile(settings.max_batch_size, settings.max_input_len, default_max_new_tokens(settings, model))
+    estimate = estimate_memory(model, profile.max_batch_size, profile.kv_capacity, profile.max_input_len)
+    report["memory_estimate_gib"] = {k: round(v / 2**30, 2) for k, v in estimate.items()}
+    report["engine_profile"] = {"max_batch_size": profile.max_batch_size, "max_input_len": profile.max_input_len,
+                                "max_new_tokens": profile.max_new_tokens, "kv_capacity": profile.kv_capacity}
+    return settings, model, profile
 
 
 __all__ = ["main", "setup_logging"]

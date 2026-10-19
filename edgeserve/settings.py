@@ -101,8 +101,8 @@ _SERVER_FLAGS = {
 def add_engine_arguments(parser: argparse.ArgumentParser) -> None:
     """Flags shared by serve / build / info (model and engine limits)."""
     parser.add_argument("--model", type=Path, metavar="DIR",
-                        help="model folder: a TensorRT Edge-LLM export (the llm/ folder tensorrt-edgellm-export "
-                             "writes) [EDGESERVE_MODEL]")
+                        help="model folder made by edgeserve export (or the llm/ folder of a TensorRT Edge-LLM "
+                             "0.11 export) [EDGESERVE_MODEL]")
     parser.add_argument("--max-input-len", type=int, metavar="N",
                         help="longest prompt in tokens the engine accepts (default 3072) [EDGESERVE_MAX_INPUT_LEN]")
     parser.add_argument("--max-new-tokens", type=int, metavar="N",

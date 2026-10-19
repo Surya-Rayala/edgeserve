@@ -126,6 +126,18 @@ def read(path: Path | None = None) -> dict[str, str]:
     return dict(values)
 
 
+# Settings that are secrets (the API key, the TLS key's path): never passed on to a process edgeserve starts.
+SECRET_VARIABLES = ("EDGESERVE_API_KEY", "EDGESERVE_TLS_KEY")
+
+
+def child_environment(base: dict[str, str] | None = None, **extra: str) -> dict[str, str]:
+    """The environment for a process edgeserve starts: ``base`` (default: this process's environment) without
+    edgeserve's secrets, plus ``extra``."""
+    env = {k: v for k, v in (os.environ if base is None else base).items() if k not in SECRET_VARIABLES}
+    env.update(extra)
+    return env
+
+
 def value(name: str) -> str | None:
     """A setting from the environment, else from the settings file (empty counts as unset)."""
     env = os.environ.get(name, "").strip()

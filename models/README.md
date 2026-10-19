@@ -1,6 +1,7 @@
 # Local model folders
 
-A place for the model folders this machine serves. Export a model here and serve it:
+A place for the model folders this machine serves. Export a model here, or copy in a folder that
+TensorRT Edge-LLM 0.11 already exported (its `llm` folder), and serve it:
 
 ```bash
 edgeserve export <checkpoint> models/<name>
