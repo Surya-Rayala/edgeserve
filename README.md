@@ -4,7 +4,8 @@ Run LLMs on NVIDIA Jetson and NVIDIA GPUs behind an OpenAI-compatible API, using
 [NVIDIA TensorRT Edge-LLM](https://github.com/NVIDIA/TensorRT-Edge-LLM).
 
 - OpenAI API (chat, completions, streaming): works with the OpenAI SDKs and curl.
-- Serves Hugging Face models and your own checkpoints: fine-tuned, pruned, or quantized to INT4.
+- Serves Hugging Face models and your own fine-tuned, pruned or quantized checkpoints, in FP16/BF16,
+  INT4 (AWQ, GPTQ), INT8, FP8 or NVFP4, whichever your GPU supports.
 - Converts the model to a TensorRT engine for your GPU on first start, and caches it.
 - Keeps your request IDs and records metrics per request and per token (latency, tokens/s, energy).
 - Guards small devices against running out of memory.
@@ -106,14 +107,16 @@ Choose a precision your GPU supports:
 
 | Weights | Hugging Face name looks like | Jetson Orin | RTX 30/40, A100, A10, L4 | Thor, RTX 50, B200 |
 |---|---|---|---|---|
-| INT4 (AWQ or GPTQ) | `…-Instruct-AWQ`, `…-GPTQ-Int4` | ✅ use this on Jetson | ✅ | ✅ |
-| FP16 / BF16 (original) | `Qwen/Qwen2.5-1.5B-Instruct` | only up to about 0.6B on 8 GB | ✅ | ✅ |
+| FP16 / BF16 (the original weights) | `Qwen/Qwen2.5-1.5B-Instruct` | ✅ | ✅ | ✅ |
+| INT4 (AWQ or GPTQ) | `…-Instruct-AWQ`, `…-GPTQ-Int4` | ✅ | ✅ | ✅ |
+| INT8 (SmoothQuant) | quantize it yourself ([how](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/EXPORT.md#quantizing-and-other-tools-by-hand)) | ✅ | ✅ | ✅ |
 | FP8 | `nvidia/…-FP8` | ❌ | RTX 40, L4 only | ✅ |
 | NVFP4 | `nvidia/…-NVFP4` | ❌ | ❌ | ✅ |
 
-On an 8 GB Orin Nano, INT4 models of 0.5B to 4B parameters were tested, and a pruned 6B model
-with a reduced vocabulary fits too. Converting an FP16 model to an engine needs several times its
-size in memory, so on an 8 GB board FP16 works only for models up to about 0.6B.
+Memory decides the model size: building an engine needs several times the model's size in memory.
+On an 8 GB Orin Nano, FP16 models up to about 0.6B parameters and INT4 models of 0.5B to 4B were
+tested, and a pruned 6B INT4 model with a reduced vocabulary fits too. Boards and GPUs with more
+memory run correspondingly larger models, in any precision they support.
 More: every argument, what the export does, exporter options and errors in
 [docs/EXPORT.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/EXPORT.md); supported models and
 memory in [docs/MODELS.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/MODELS.md).
@@ -257,10 +260,13 @@ edgeserve service install                            # serve it now and at every
   in `config.json`, one entry per layer, and each layer's `gate_proj`, `up_proj` and `down_proj`
   weights cut to that width. edgeserve's exporter patch reads it. For INT4, use widths that are
   multiples of 128.
-- **Quantized to INT4:** AWQ or GPTQ checkpoints (`quantization_config` in `config.json`, and
-  `qweight`, `qzeros` and `scales` tensors; group size 128). Asymmetric zero points are kept exact;
+- **Quantized:** INT4 checkpoints in the AWQ or GPTQ format (`quantization_config` in `config.json`,
+  and `qweight`, `qzeros` and `scales` tensors; group size 128). Asymmetric zero points are kept exact;
   stock Edge-LLM clips them
   ([INT4 quality](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/EXPORT.md#quality-of-int4-models)).
+  FP8 and NVFP4 checkpoints made with NVIDIA ModelOpt (such as `nvidia/…-FP8`) export the same way, for
+  GPUs that run them. To quantize a model yourself (INT4, INT8, FP8 or NVFP4):
+  [docs/EXPORT.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/EXPORT.md#quantizing-and-other-tools-by-hand).
 - **Smaller output vocabulary:** pass the folder with `vocab_map.safetensors` to the exporter:
   `edgeserve export <checkpoint-dir> <model-dir> -- --reduced-vocab-dir <vocab-dir>`.
 
