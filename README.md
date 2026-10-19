@@ -1,0 +1,382 @@
+# edgeserve
+
+Run LLMs on NVIDIA Jetson and NVIDIA GPUs behind an OpenAI-compatible API, using
+[NVIDIA TensorRT Edge-LLM](https://github.com/NVIDIA/TensorRT-Edge-LLM).
+
+- OpenAI API (chat, completions, streaming): works with the OpenAI SDKs and curl.
+- Serves Hugging Face models and your own checkpoints: fine-tuned, pruned, or quantized to INT4.
+- Converts the model to a TensorRT engine for your GPU on first start, and caches it.
+- Keeps your request IDs and records metrics per request and per token (latency, tokens/s, energy).
+- Guards small devices against running out of memory.
+- `edgeserve setup --network` adds an API key and HTTPS for other machines.
+
+**Steps:** [1. Install](#1-install) · [2. Build the GPU runtime](#2-build-the-gpu-runtime) ·
+[3. Export a model](#3-export-a-model) · [4. Serve](#4-serve) ([free memory](#free-memory-on-a-jetson)) ·
+[5. Send requests](#5-send-requests) ·
+[6. Access from other machines](#6-access-from-other-machines). Also: [your own models](#your-own-models),
+[batch jobs](#batch-jobs), [service](#run-as-a-service), [commands](#command-reference),
+[options and settings](#options-and-settings), [troubleshooting](#troubleshooting),
+[documentation](#documentation).
+
+In the commands below, replace each `<placeholder>` with your own value.
+
+## Requirements
+
+| Device | Software | Status |
+|---|---|---|
+| Jetson Orin Nano / Orin NX / AGX Orin | JetPack 6.2.x or 7.2.x | tested (Orin Nano 8 GB, JetPack 6.2.1) |
+| Jetson Thor | JetPack 7.x | expected to work |
+| x86-64 PC with an NVIDIA RTX 30/40/50, A100, A10, L4, L40S or B200 | Ubuntu 22.04/24.04, CUDA 12 or 13, TensorRT 10 | expected to work |
+
+Python 3.10 or newer and build tools are needed too. On a Jetson:
+
+```bash
+sudo apt install nvidia-jetpack git cmake build-essential python3-venv
+```
+
+On a PC, install the NVIDIA driver, CUDA and TensorRT 10 with its development packages, then
+`sudo apt install git cmake build-essential python3-venv`. `edgeserve setup` checks all of this
+and prints what is missing. edgeserve 0.1 is built on TensorRT Edge-LLM 0.11 (commit
+`0f52705723ab`). Details per platform:
+[docs/PLATFORMS.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/PLATFORMS.md).
+
+## 1. Install
+
+With pip:
+
+```bash
+python3 -m venv <venv-dir>
+source <venv-dir>/bin/activate
+pip install --upgrade pip
+pip install edgeserve
+```
+
+Or from the repository:
+
+```bash
+git clone https://github.com/Surya-Rayala/edgeserve.git
+cd edgeserve
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -e .
+```
+
+`<venv-dir>` is any new folder for the Python environment, for example `~/edgeserve-venv`. Both
+ways give the same `edgeserve` command, and both keep their files in the same places: settings in
+`~/.config/edgeserve/`, the GPU runtime and the model exporter in `~/.local/share/edgeserve/`,
+engines in `~/.cache/edgeserve/`. In a new terminal, run the `source …/bin/activate` line again.
+
+## 2. Build the GPU runtime
+
+```bash
+edgeserve setup
+```
+
+Run it once per machine, as your normal user (not with sudo). It downloads TensorRT Edge-LLM,
+builds it for your GPU and tests it. This takes about 30 minutes on a Jetson Orin Nano (less on a
+PC) and needs internet access and 3 GB of disk. Run it again after upgrading edgeserve, JetPack,
+CUDA or TensorRT: it rebuilds only what changed.
+
+## 3. Export a model
+
+edgeserve does not load Hugging Face folders, GGUF files or other engines directly. It serves a
+model folder in TensorRT Edge-LLM's format, which `edgeserve export` makes from a Hugging Face
+checkpoint:
+
+```bash
+edgeserve export <checkpoint> <model-dir>
+```
+
+| Argument | What it is |
+|---|---|
+| `<checkpoint>` | a Hugging Face model ID, such as `Qwen/Qwen2.5-0.5B-Instruct-AWQ`, or the folder of your own checkpoint ([your own models](#your-own-models)) |
+| `<model-dir>` | a new folder for the exported model, such as `~/models/qwen2.5-0.5b-instruct-awq`; its name becomes the model's name |
+
+The first export installs TensorRT Edge-LLM's exporter (a few minutes, about 5 GB of disk). An
+export takes a few minutes; it runs on the CPU, so it works on the Jetson itself or on any Linux
+PC with edgeserve installed (no `edgeserve setup` needed there; copy `<model-dir>` to the Jetson
+afterwards). It also copies the model's default sampling settings (`generation_config.json`).
+For a gated model such as Llama, accept its license on huggingface.co and pass your access token:
+`HF_TOKEN=<your token> edgeserve export <checkpoint> <model-dir>`.
+
+**Which models.** Text models of these families: Llama 3.x, Qwen2 and Qwen2.5, Qwen3, and HunYuan
+dense ([tested models](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/MODELS.md#tested-models)).
+Choose a precision your GPU supports:
+
+| Weights | Hugging Face name looks like | Jetson Orin | RTX 30/40, A100, A10, L4 | Thor, RTX 50, B200 |
+|---|---|---|---|---|
+| INT4 (AWQ or GPTQ) | `…-Instruct-AWQ`, `…-GPTQ-Int4` | ✅ use this on Jetson | ✅ | ✅ |
+| FP16 / BF16 (original) | `Qwen/Qwen2.5-1.5B-Instruct` | only up to about 0.6B on 8 GB | ✅ | ✅ |
+| FP8 | `nvidia/…-FP8` | ❌ | RTX 40, L4 only | ✅ |
+| NVFP4 | `nvidia/…-NVFP4` | ❌ | ❌ | ✅ |
+
+On an 8 GB Orin Nano, INT4 models of 0.5B to 4B parameters were tested, and a pruned 6B model
+with a reduced vocabulary fits too. Converting an FP16 model to an engine needs several times its
+size in memory, so on an 8 GB board FP16 works only for models up to about 0.6B.
+More: every argument, what the export does, exporter options and errors in
+[docs/EXPORT.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/EXPORT.md); supported models and
+memory in [docs/MODELS.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/MODELS.md).
+
+## 4. Serve
+
+```bash
+edgeserve serve --model <model-dir>
+```
+
+The first start converts the model to a TensorRT engine for your GPU (a minute to a few minutes)
+and caches it; later starts take seconds. The server listens on `http://127.0.0.1:8000`, which
+only this machine can reach. Stop it with Ctrl-C.
+
+To test it, run `edgeserve check` in a second terminal. To serve the model without typing its
+path each time, run `edgeserve setup --model <model-dir>` once; after that, `edgeserve serve` is
+enough. On a Jetson, [free memory](#free-memory-on-a-jetson) first: the model shares the board's
+memory with everything else running.
+
+## Free memory on a Jetson
+
+On Jetson the GPU has no memory of its own: the model, its engine build and everything else
+running share the board's RAM. Before serving (and especially before the first start, which
+builds the engine), free what you do not need:
+
+```bash
+free -h                                           # "available" is what a model can use
+ps -eo rss,comm --sort=-rss | head                # the programs that use the most memory (in KB)
+sudo systemctl isolate multi-user.target          # stop the desktop until the next reboot (about 0.8 GB)
+sudo systemctl set-default multi-user.target      # keep it stopped after reboots (graphical.target undoes it)
+docker ps                                         # stop containers you do not need: docker stop <name>
+edgeserve info --model <model-dir>                # compare memory_estimate_gib.total with memory_available_gib
+```
+
+Also close IDE remote sessions (VS Code or Cursor servers), notebooks and other GPU programs on
+the board: each can hold 0.5–1 GB. Serve one model at a time. If an engine build or load still
+fails while `free -h` shows enough available memory, release the file caches first:
+`sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches`. Sizes per model, and how to make a
+model fit: [docs/MODELS.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/MODELS.md#memory);
+power modes and swap: [docs/PLATFORMS.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/PLATFORMS.md#jetson).
+
+## 5. Send requests
+
+With curl:
+
+```bash
+curl -s http://127.0.0.1:8000/v1/models
+curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -H "X-Request-Id: demo-001" \
+  -d '{"messages": [{"role": "user", "content": "What is a GPU? Answer in one sentence."}], "max_tokens": 100}'
+```
+
+With Python (`pip install openai`):
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="none")  # no key needed on this machine
+model = client.models.list().data[0].id                                  # the served model's name
+reply = client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": "What is a GPU? Answer in one sentence."}],
+    max_tokens=100,
+    extra_headers={"X-Request-Id": "demo-002"},
+)
+print(reply.choices[0].message.content)
+print(reply.model_extra["metrics"]["decode_tokens_per_s"], "tokens/s")
+```
+
+- `X-Request-Id` is optional. Your ID comes back with the response, and with
+  `edgeserve serve --output-dir <records-dir>` every request is saved as
+  `<records-dir>/records/<id>.json`, with its metrics.
+- For streaming, send `"stream": true` (`stream=True` in the SDK).
+- Every field, error code and metric: [docs/API.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/API.md).
+
+## 6. Access from other machines
+
+```bash
+edgeserve setup --network
+```
+
+This creates three things in `~/.config/edgeserve/`:
+
+- **An API key.** It is printed once. To see it again:
+  `grep EDGESERVE_API_KEY ~/.config/edgeserve/edgeserve.env`.
+- **An HTTPS certificate**, and `edgeserve-ca.crt`, the file clients need to trust it.
+- **The setting to listen on the network** (all interfaces, port 8000).
+
+Restart `edgeserve serve`. Then, on each client machine (`<server-ip>` is the server's IP
+address, which `edgeserve setup --network` prints; `<user>` is your user name on the server):
+
+```bash
+scp <user>@<server-ip>:.config/edgeserve/edgeserve-ca.crt .
+export EDGESERVE_API_KEY=<the key>
+curl --cacert edgeserve-ca.crt -H "Authorization: Bearer $EDGESERVE_API_KEY" https://<server-ip>:8000/v1/models
+```
+
+In Python, pass the key and the CA file:
+
+```python
+import os, ssl
+import httpx
+from openai import OpenAI
+
+client = OpenAI(base_url="https://<server-ip>:8000/v1", api_key=os.environ["EDGESERVE_API_KEY"],
+                http_client=httpx.Client(verify=ssl.create_default_context(cafile="edgeserve-ca.crt")))
+```
+
+- **New key:** delete the `EDGESERVE_API_KEY=` line in `~/.config/edgeserve/edgeserve.env`, run
+  `edgeserve setup --network` (it prints the new key) and restart the server. You can also write
+  your own key on that line.
+- **New IP address or host name:** run `edgeserve setup --network` again and restart the server.
+  Clients keep their `edgeserve-ca.crt`.
+- **Firewall:** allow only your own network to reach port 8000. `edgeserve setup --network` prints
+  the `ufw` commands for your network.
+- **This machine only again:** set `EDGESERVE_HOST=127.0.0.1` in the settings file.
+
+## Your own models
+
+Fine-tuned, pruned and quantized checkpoints of the supported families are exported and served
+like any other model. To host one for your network, starting at every boot:
+
+```bash
+edgeserve export <checkpoint-dir> <model-dir>        # once; <checkpoint-dir> is your checkpoint folder
+edgeserve setup --network --model <model-dir>        # make it the default model; API key and HTTPS
+edgeserve service install                            # serve it now and at every boot
+```
+
+`<checkpoint-dir>` must be a Hugging Face checkpoint folder:
+
+| File | Needed | What it holds |
+|---|---|---|
+| `config.json` | yes | the architecture; `model_type` is `llama`, `qwen2`, `qwen3` or `hunyuan_v1_dense` |
+| `model.safetensors` (or shards with `model.safetensors.index.json`; `pytorch_model.bin` also works) | yes | the weights |
+| `tokenizer.json`, `tokenizer_config.json` | yes | the tokenizer, and the chat template (`chat_template` in `tokenizer_config.json`, or a `chat_template.jinja` file) |
+| `generation_config.json` | no | default sampling settings and end-of-sequence tokens; copied into `<model-dir>` |
+
+- **Fine-tuned:** no changes needed. Merge LoRA adapters into the weights first (PEFT's `merge_and_unload()`).
+- **Pruned:** fewer layers, or fewer heads or a smaller hidden size in every layer, need only the
+  matching numbers in `config.json`. A different MLP width in each layer needs `"intermediate_sizes": [<width of layer 0>, <width of layer 1>, …]`
+  in `config.json`, one entry per layer, and each layer's `gate_proj`, `up_proj` and `down_proj`
+  weights cut to that width. edgeserve's exporter patch reads it. For INT4, use widths that are
+  multiples of 128.
+- **Quantized to INT4:** AWQ or GPTQ checkpoints (`quantization_config` in `config.json`, and
+  `qweight`, `qzeros` and `scales` tensors; group size 128). Asymmetric zero points are kept exact;
+  stock Edge-LLM clips them
+  ([INT4 quality](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/EXPORT.md#quality-of-int4-models)).
+- **Smaller output vocabulary:** pass the folder with `vocab_map.safetensors` to the exporter:
+  `edgeserve export <checkpoint-dir> <model-dir> -- --reduced-vocab-dir <vocab-dir>`.
+
+Details, and how to check a pruned export: [docs/EXPORT.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/EXPORT.md#your-own-checkpoints).
+
+## Batch jobs
+
+```bash
+edgeserve batch <requests.jsonl> --output-dir <results-dir>
+```
+
+`<requests.jsonl>` has one request per line, for example:
+
+```jsonl
+{"id": "q1", "messages": [{"role": "user", "content": "What is CUDA?"}], "max_tokens": 200}
+{"id": "q2", "prompt": "<a prompt with the chat template already applied>"}
+```
+
+The OpenAI Batch format (`custom_id`, `method`, `url`, `body`) works too. Results go into
+`<results-dir>/records/<id>.json`, `<results-dir>/results.jsonl` and `<results-dir>/run.json`
+(counts, throughput, latency, energy). Running the same command again skips the finished IDs, so
+an interrupted batch resumes. For another machine's server, add
+`--server https://<server-ip>:8000 --ca-cert edgeserve-ca.crt`.
+
+## Run as a service
+
+```bash
+edgeserve service install    # starts the server now and at every boot; asks for your sudo password
+journalctl -u edgeserve -f   # its log
+edgeserve service remove     # stop and remove it
+```
+
+The service serves the model and settings from `edgeserve setup`, so set the model first with
+`edgeserve setup --model <model-dir>`. Run these commands as your normal user, not with sudo.
+`edgeserve service install --print` only shows the unit file. After changing the settings,
+restart it with `sudo systemctl restart edgeserve`.
+
+## Command reference
+
+| Command | What it does |
+|---|---|
+| `edgeserve setup [--network] [--model DIR]` | build the GPU runtime; `--model` sets the default model; `--network` adds an API key, HTTPS and listening on the network |
+| `edgeserve export CHECKPOINT MODEL_DIR [-- exporter options]` | export a Hugging Face checkpoint (an ID or a folder) into a model folder |
+| `edgeserve serve` | run the server |
+| `edgeserve build` | only convert the model to an engine (or check the cached one), then exit |
+| `edgeserve info` | settings and where each comes from, the GPU runtime, the hardware; with `--model`, the model, its memory estimate and its cached engine |
+| `edgeserve check [--server URL] [--ca-cert FILE]` | test a running server end to end |
+| `edgeserve batch INPUT --output-dir DIR [--server URL] [--ca-cert FILE] [--concurrency N]` | run a JSONL file of requests |
+| `edgeserve service install [--print]`, `edgeserve service remove` | run the server at boot (systemd) |
+| `edgeserve --version` | the edgeserve and TensorRT Edge-LLM versions |
+
+## Options and settings
+
+Each option can also be set as a line `NAME=value` in `~/.config/edgeserve/edgeserve.env` (the file
+`edgeserve setup` writes; restart the server after editing it) or as an environment variable. An
+option on the command line wins over the environment, which wins over the file. `edgeserve info`
+shows where each value came from.
+
+| Option (`serve`; `build` and `info` take the first five) | Setting | Default | Meaning |
+|---|---|---|---|
+| `--model DIR` | `EDGESERVE_MODEL` | none | the model folder (an absolute path in the file) |
+| `--max-input-len N` | `EDGESERVE_MAX_INPUT_LEN` | 3072 | longest prompt in tokens; longer prompts are refused, never cut |
+| `--max-new-tokens N` | `EDGESERVE_MAX_NEW_TOKENS` | the model's `generation_config.json`, else 512 | output length when a request sets no `max_tokens` |
+| `--max-batch-size N` | `EDGESERVE_MAX_BATCH_SIZE` | 1 | requests generated together; each one needs its own memory |
+| `--cache-dir DIR` | `EDGESERVE_CACHE_DIR` | `~/.cache/edgeserve` | where engines are kept |
+| `--output-dir DIR` | `EDGESERVE_OUTPUT_DIR` | none | save a record of every request here |
+| `--host ADDRESS` | `EDGESERVE_HOST` | 127.0.0.1 | `127.0.0.1`: this machine only; `0.0.0.0`: the network (needs an API key) |
+| `--port N` | `EDGESERVE_PORT` | 8000 | port |
+| none | `EDGESERVE_API_KEY` | none | the key clients must send as `Authorization: Bearer <key>` (no option, so it never shows in process lists) |
+| none | `EDGESERVE_TLS_CERT`, `EDGESERVE_TLS_KEY` | none | HTTPS certificate and private key (PEM files) |
+| none | `EDGESERVE_NATIVE_DIR` | none | use another GPU runtime build (development) |
+
+Changing `--max-input-len`, `--max-new-tokens` or `--max-batch-size` builds a new engine (cached
+too). `check` and `batch` use this machine's server unless given `--server URL`, and trust a
+server's certificate with `--ca-cert FILE`; `batch --concurrency N` sets how many requests are in
+flight (default: the server's batch size + 1). Environment only: `EDGESERVE_CONFIG_DIR` (another
+settings folder), `EDGESERVE_API_KEY` on a client (the key `check` and `batch` send), and for
+`edgeserve setup`, `TRT_PACKAGE_DIR` (a TensorRT tarball folder) and `JOBS` (parallel compile jobs).
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `edgeserve setup` lists missing packages | install them with the `apt` line it prints, then run it again |
+| "the GPU runtime is not built yet" or "… from other sources" | run `edgeserve setup` |
+| `/health/ready` says `building_engine` | normal on the first start of a model or new limits |
+| "not enough memory", or the engine build "ran out of memory" | [free memory](#free-memory-on-a-jetson) on a Jetson; use an INT4 or a smaller model, lower `--max-input-len`, keep `--max-batch-size 1` |
+| "exported with TensorRT Edge-LLM x.y" | export the model again with `edgeserve export` |
+| "has no config.json" | `--model` must be the folder `edgeserve export` made; for `export`, the checkpoint folder must hold `config.json` |
+| HTTP 401 | send the key: `Authorization: Bearer <key>` |
+| certificate errors | give the client `edgeserve-ca.crt`; use a host name or address the certificate lists, or run `edgeserve setup --network` again after an address change |
+| `<host>.local` does not connect | use the IP address; mDNS can announce a Docker bridge address (fix: `deny-interfaces=docker0` in `/etc/avahi/avahi-daemon.conf`) |
+| other machines cannot connect | run `edgeserve setup --network` and restart; check the firewall (`sudo ufw status`) |
+| answers differ from Hugging Face | the server log lists `generation_config.json` options Edge-LLM does not support (e.g. `repetition_penalty`); for INT4 models see [INT4 quality](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/EXPORT.md#quality-of-int4-models) |
+| `edgeserve export` fails | the error table in [docs/EXPORT.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/EXPORT.md#errors) |
+
+## Documentation
+
+| Topic | Document |
+|---|---|
+| Exporting: every argument, what the export does, your own fine-tuned, pruned and quantized checkpoints, INT4 quality, exporter options, errors | [docs/EXPORT.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/EXPORT.md) |
+| Models: supported families, tested models, precision per GPU, memory | [docs/MODELS.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/MODELS.md) |
+| The API: endpoints, request fields, sampling, streaming, errors, request IDs, records | [docs/API.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/API.md) |
+| Metrics: every per-request and per-token metric and how it is measured | [docs/METRICS.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/METRICS.md) |
+| Platforms: requirements per device, Jetson settings, measured performance, Edge-LLM patches | [docs/PLATFORMS.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/PLATFORMS.md) |
+| How it works: processes, GPU runtime, engine cache, request lifecycle, worker protocol | [docs/ARCHITECTURE.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/ARCHITECTURE.md) |
+
+## Development
+
+```bash
+pip install -e ".[test]"
+python -m pytest            # no GPU needed; needs g++ and nlohmann-json3-dev
+```
+
+## License
+
+Apache License 2.0 ([LICENSE](https://github.com/Surya-Rayala/edgeserve/blob/main/LICENSE)). edgeserve
+downloads and builds NVIDIA TensorRT Edge-LLM (Apache 2.0), which is not part of this package. Models
+have their own licenses.

@@ -1,0 +1,60 @@
+diff --git a/cpp/kernels/layerNorm/cuteDslLayerNormRunner.h b/cpp/kernels/layerNorm/cuteDslLayerNormRunner.h
+index 633c0fb..43cb6e8 100644
+--- a/cpp/kernels/layerNorm/cuteDslLayerNormRunner.h
++++ b/cpp/kernels/layerNorm/cuteDslLayerNormRunner.h
+@@ -19,6 +19,15 @@
+ 
+ #if defined(CUTE_DSL_LAYERNORM_ENABLED)
+ 
++#include <cuda.h>
++#include <cuda_runtime.h>
++// CUDA 12.0-12.7 (e.g. JetPack 6) lacks cudaLibrary_t; same declaration-only shim as
++// cuteDslFMHAV2Runner.h (the CuTe DSL cudart shim library provides cudaLibraryUnload).
++#if CUDA_VERSION >= 12000 && CUDA_VERSION < 12080
++typedef CUlibrary cudaLibrary_t;
++extern "C" cudaError_t cudaLibraryUnload(cudaLibrary_t library);
++#endif
++
+ #include "kernels/cuteDslModuleLoader.h"
+ 
+ #if defined(CUTE_DSL_CUDA_ERROR_CHECK)
+diff --git a/cpp/kernels/moe/f16_cutedsl/cuteDslF16MoeRunner.h b/cpp/kernels/moe/f16_cutedsl/cuteDslF16MoeRunner.h
+index 123d793..0a59b65 100644
+--- a/cpp/kernels/moe/f16_cutedsl/cuteDslF16MoeRunner.h
++++ b/cpp/kernels/moe/f16_cutedsl/cuteDslF16MoeRunner.h
+@@ -19,6 +19,15 @@
+ 
+ #if defined(CUTE_DSL_F16_MOE_ENABLED)
+ 
++#include <cuda.h>
++#include <cuda_runtime.h>
++// CUDA 12.0-12.7 (e.g. JetPack 6) lacks cudaLibrary_t; same declaration-only shim as
++// cuteDslFMHAV2Runner.h (the CuTe DSL cudart shim library provides cudaLibraryUnload).
++#if CUDA_VERSION >= 12000 && CUDA_VERSION < 12080
++typedef CUlibrary cudaLibrary_t;
++extern "C" cudaError_t cudaLibraryUnload(cudaLibrary_t library);
++#endif
++
+ #include "kernels/cuteDslModuleLoader.h"
+ 
+ #if defined(CUTE_DSL_CUDA_ERROR_CHECK)
+diff --git a/cpp/kernels/rmsNorm/cuteDslRmsNormRunner.h b/cpp/kernels/rmsNorm/cuteDslRmsNormRunner.h
+index ccc513b..ce5faee 100644
+--- a/cpp/kernels/rmsNorm/cuteDslRmsNormRunner.h
++++ b/cpp/kernels/rmsNorm/cuteDslRmsNormRunner.h
+@@ -19,6 +19,15 @@
+ 
+ #if defined(CUTE_DSL_RMSNORM_ENABLED)
+ 
++#include <cuda.h>
++#include <cuda_runtime.h>
++// CUDA 12.0-12.7 (e.g. JetPack 6) lacks cudaLibrary_t; same declaration-only shim as
++// cuteDslFMHAV2Runner.h (the CuTe DSL cudart shim library provides cudaLibraryUnload).
++#if CUDA_VERSION >= 12000 && CUDA_VERSION < 12080
++typedef CUlibrary cudaLibrary_t;
++extern "C" cudaError_t cudaLibraryUnload(cudaLibrary_t library);
++#endif
++
+ #include "kernels/cuteDslModuleLoader.h"
+ 
+ #if defined(CUTE_DSL_CUDA_ERROR_CHECK)

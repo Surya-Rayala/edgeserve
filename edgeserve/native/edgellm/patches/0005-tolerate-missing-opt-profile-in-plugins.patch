@@ -1,0 +1,186 @@
+diff --git a/cpp/plugins/attentionPlugin/attentionPlugin.cpp b/cpp/plugins/attentionPlugin/attentionPlugin.cpp
+index b8a73ad..ee696a8 100644
+--- a/cpp/plugins/attentionPlugin/attentionPlugin.cpp
++++ b/cpp/plugins/attentionPlugin/attentionPlugin.cpp
+@@ -1225,6 +1225,16 @@ bool AttentionPlugin::supportsFormatCombination(
+ int32_t AttentionPlugin::configurePlugin(
+     DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
+ {
++    auto const inputProfiles = withProfileOpt(in, nbInputs);
++    auto const outputProfiles = withProfileOpt(out, nbOutputs);
++    if (!inputProfiles.empty())
++    {
++        in = inputProfiles.data();
++    }
++    if (!outputProfiles.empty())
++    {
++        out = outputProfiles.data();
++    }
+     AttentionInputLayout const inputLayout = resolveAttentionInputLayout(mEnableQKNorm != 0,
+         mEnableContextMaskSelector != 0, mEnableTreeAttention != 0, mEnableVisionBlockAttention != 0,
+         mSkipSoftmaxScaleFactor > 0.F, mSupportsBoundedKVCache, mEnableAttentionSink != 0);
+diff --git a/cpp/plugins/fp16MoePlugin/fp16MoePlugin.cpp b/cpp/plugins/fp16MoePlugin/fp16MoePlugin.cpp
+index f96d36e..bceff37 100644
+--- a/cpp/plugins/fp16MoePlugin/fp16MoePlugin.cpp
++++ b/cpp/plugins/fp16MoePlugin/fp16MoePlugin.cpp
+@@ -456,6 +456,16 @@ bool Fp16MoePlugin::supportsFormatCombination(
+ int32_t Fp16MoePlugin::configurePlugin(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
+     DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) noexcept
+ {
++    auto const inputProfiles = withProfileOpt(inputs, nbInputs);
++    auto const outputProfiles = withProfileOpt(outputs, nbOutputs);
++    if (!inputProfiles.empty())
++    {
++        inputs = inputProfiles.data();
++    }
++    if (!outputProfiles.empty())
++    {
++        outputs = outputProfiles.data();
++    }
+     try
+     {
+         if (inputs == nullptr || outputs == nullptr || nbInputs != numInputs() || nbOutputs != kNB_OUTPUTS)
+diff --git a/cpp/plugins/int4MoePlugin/int4MoePlugin.cpp b/cpp/plugins/int4MoePlugin/int4MoePlugin.cpp
+index 2bf4929..e307d3a 100644
+--- a/cpp/plugins/int4MoePlugin/int4MoePlugin.cpp
++++ b/cpp/plugins/int4MoePlugin/int4MoePlugin.cpp
+@@ -431,6 +431,16 @@ bool Int4MoePlugin::supportsFormatCombination(
+ int32_t Int4MoePlugin::configurePlugin(
+     DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
+ {
++    auto const inputProfiles = withProfileOpt(in, nbInputs);
++    auto const outputProfiles = withProfileOpt(out, nbOutputs);
++    if (!inputProfiles.empty())
++    {
++        in = inputProfiles.data();
++    }
++    if (!outputProfiles.empty())
++    {
++        out = outputProfiles.data();
++    }
+     if (in == nullptr || out == nullptr || nbInputs != 6 || nbOutputs != 1)
+     {
+         return -1;
+diff --git a/cpp/plugins/layerNormPlugin/layerNormPlugin.cpp b/cpp/plugins/layerNormPlugin/layerNormPlugin.cpp
+index d2465a1..89dbd04 100644
+--- a/cpp/plugins/layerNormPlugin/layerNormPlugin.cpp
++++ b/cpp/plugins/layerNormPlugin/layerNormPlugin.cpp
+@@ -475,6 +475,16 @@ bool LayerNormPlugin::supportsFormatCombination(
+ int32_t LayerNormPlugin::configurePlugin(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
+     DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) noexcept
+ {
++    auto const inputProfiles = withProfileOpt(inputs, nbInputs);
++    auto const outputProfiles = withProfileOpt(outputs, nbOutputs);
++    if (!inputProfiles.empty())
++    {
++        inputs = inputProfiles.data();
++    }
++    if (!outputProfiles.empty())
++    {
++        outputs = outputProfiles.data();
++    }
+     try
+     {
+         if (inputs == nullptr || outputs == nullptr || nbInputs != kNB_INPUTS || nbOutputs != kNB_OUTPUTS)
+diff --git a/cpp/plugins/qkvConcatPlugin/qkvConcatPlugin.cpp b/cpp/plugins/qkvConcatPlugin/qkvConcatPlugin.cpp
+index 2ea8836..9b2db6a 100644
+--- a/cpp/plugins/qkvConcatPlugin/qkvConcatPlugin.cpp
++++ b/cpp/plugins/qkvConcatPlugin/qkvConcatPlugin.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include "qkvConcatPlugin.h"
+ #include "common/logger.h"
++#include "plugins/utils/pluginUtils.h"
+ 
+ #include <cstddef>
+ #include <cstdint>
+@@ -203,6 +204,16 @@ bool QkvConcatPlugin::supportsFormatCombination(
+ int32_t QkvConcatPlugin::configurePlugin(
+     DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
+ {
++    auto const inputProfiles = withProfileOpt(in, nbInputs);
++    auto const outputProfiles = withProfileOpt(out, nbOutputs);
++    if (!inputProfiles.empty())
++    {
++        in = inputProfiles.data();
++    }
++    if (!outputProfiles.empty())
++    {
++        out = outputProfiles.data();
++    }
+     if (in == nullptr || out == nullptr || nbInputs != kNUM_INPUTS || nbOutputs != kNUM_OUTPUTS)
+     {
+         LOG_ERROR("QkvConcatPlugin: expected three inputs and one output");
+diff --git a/cpp/plugins/rmsNormPlugin/rmsNormPlugin.cpp b/cpp/plugins/rmsNormPlugin/rmsNormPlugin.cpp
+index 9e1301d..35bd70c 100644
+--- a/cpp/plugins/rmsNormPlugin/rmsNormPlugin.cpp
++++ b/cpp/plugins/rmsNormPlugin/rmsNormPlugin.cpp
+@@ -385,6 +385,16 @@ bool RmsNormPlugin::supportsFormatCombination(
+ int32_t RmsNormPlugin::configurePlugin(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
+     DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) noexcept
+ {
++    auto const inputProfiles = withProfileOpt(inputs, nbInputs);
++    auto const outputProfiles = withProfileOpt(outputs, nbOutputs);
++    if (!inputProfiles.empty())
++    {
++        inputs = inputProfiles.data();
++    }
++    if (!outputProfiles.empty())
++    {
++        outputs = outputProfiles.data();
++    }
+     try
+     {
+         if (inputs == nullptr || outputs == nullptr || nbInputs != kNB_INPUTS || nbOutputs != kNB_OUTPUTS)
+diff --git a/cpp/plugins/utils/pluginUtils.h b/cpp/plugins/utils/pluginUtils.h
+index 656a39a..5e3f7ee 100644
+--- a/cpp/plugins/utils/pluginUtils.h
++++ b/cpp/plugins/utils/pluginUtils.h
+@@ -26,6 +26,7 @@
+ #include <cstring>
+ #include <optional>
+ #include <string>
++#include <vector>
+ 
+ //! Export marker for the plugin library's C-ABI entry points. The libraries are
+ //! built with -fvisibility=hidden, so symbols dlsym'd by the host must stay visible.
+@@ -177,5 +178,39 @@ size_t accumulateWorkspaceSize(size_t currentSize, rt::Coords const& shape, nvin
+ //! @return Assigned tensor
+ rt::Tensor assignTensorFromWorkspace(std::byte*& workspace, rt::Coords const& shape, nvinfer1::DataType dataType);
+ 
++/*!
++ * @brief Copy plugin tensor descriptors, using the profile maximum where the optimum is missing
++ *
++ * TensorRT 10.3 leaves DynamicPluginTensorDesc::opt empty (nbDims == 0) when it configures V3 plugins, so
++ * per-profile shape checks would reject every profile. Returns an empty vector on allocation failure, in
++ * which case callers keep the original descriptors.
++ */
++inline std::vector<nvinfer1::DynamicPluginTensorDesc> withProfileOpt(
++    nvinfer1::DynamicPluginTensorDesc const* descs, int32_t count) noexcept
++{
++    std::vector<nvinfer1::DynamicPluginTensorDesc> result;
++    if (descs == nullptr || count <= 0)
++    {
++        return result;
++    }
++    try
++    {
++        result.assign(descs, descs + count);
++    }
++    catch (...)
++    {
++        result.clear();
++        return result;
++    }
++    for (auto& desc : result)
++    {
++        if (desc.opt.nbDims == 0 && desc.max.nbDims > 0)
++        {
++            desc.opt = desc.max;
++        }
++    }
++    return result;
++}
++
+ } // namespace plugins
+ } // namespace trt_edgellm

@@ -1,0 +1,14 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 63a4421..8279154 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -288,3 +288,9 @@ if(BUILD_PYTHON_BINDINGS)
+     include(${CMAKE_SOURCE_DIR}/packaging/cmake/InstallWheel.cmake)
+   endif()
+ endif()
++
++# Out-of-tree consumers (e.g. a serving worker) can build against the targets
++# above in this same tree by passing -DEDGELLM_EXTERNAL_SUBDIR=/path/to/project.
++if(DEFINED EDGELLM_EXTERNAL_SUBDIR AND NOT EDGELLM_EXTERNAL_SUBDIR STREQUAL "")
++  add_subdirectory(${EDGELLM_EXTERNAL_SUBDIR} external)
++endif()

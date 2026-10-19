@@ -1,0 +1,19 @@
+diff --git a/cmake/CuteDsl.cmake b/cmake/CuteDsl.cmake
+index f629f15..e9a60fb 100644
+--- a/cmake/CuteDsl.cmake
++++ b/cmake/CuteDsl.cmake
+@@ -1238,7 +1238,13 @@ function(cute_dsl_setup)
+     # 11.4.
+     if(_cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0 AND _cute_dsl_cuda_ver
+                                                          VERSION_LESS 12.8)
+-      target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
++      # Static archives cannot apply link options themselves; propagate the wrap
++      # to every executable/shared library that links them.
++      if(_tgt_type STREQUAL "STATIC_LIBRARY")
++        target_link_options(${_tgt} INTERFACE "-Wl,--wrap=_cudaLaunchKernelEx")
++      else()
++        target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
++      endif()
+     endif()
+   endforeach()
+ 

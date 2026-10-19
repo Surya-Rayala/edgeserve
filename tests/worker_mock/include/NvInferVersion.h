@@ -1,0 +1,6 @@
+#pragma once
+
+#define NV_TENSORRT_MAJOR 10
+#define NV_TENSORRT_MINOR 3
+#define NV_TENSORRT_PATCH 0
+#define NV_TENSORRT_BUILD 30

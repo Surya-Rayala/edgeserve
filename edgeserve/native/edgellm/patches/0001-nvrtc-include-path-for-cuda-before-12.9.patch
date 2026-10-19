@@ -1,0 +1,40 @@
+diff --git a/cpp/CMakeLists.txt b/cpp/CMakeLists.txt
+index 8bfc363..932df4b 100644
+--- a/cpp/CMakeLists.txt
++++ b/cpp/CMakeLists.txt
+@@ -229,6 +229,13 @@ target_include_directories(edgellmPluginJit PRIVATE ${COMMON_INCLUDE_DIRS}
+ # shared routing / tile-layout kernels resolve.
+ target_link_libraries(
+   edgellmPluginJit PRIVATE ${NVRTC_LIB} ${CUDA_DRIVER_LINK_LIB} ${CUDART_LIB})
++# CUDA < 12.9: NVRTC needs the toolkit include dir for headers that cuda_fp16.h
++# pulls in unconditionally (see pluginJitCompiler.cpp).
++if(CUDA_CTK_VERSION VERSION_LESS 12.9)
++  target_compile_definitions(
++    edgellmPluginJit
++    PRIVATE EDGELLM_NVRTC_CUDA_INCLUDE_DIR="${CUDA_RUNTIME_API_INCLUDE_DIR}")
++endif()
+ add_dependencies(edgellmPluginJit generatePluginJitEmbeddedSources)
+ edgellm_apply_qnx_warning_suppressions(edgellmPluginJit)
+ edgellm_set_hidden_visibility(edgellmPluginJit)
+diff --git a/cpp/kernels/PluginJitKernels/pluginJitCompiler.cpp b/cpp/kernels/PluginJitKernels/pluginJitCompiler.cpp
+index 21e42ff..9c80b09 100644
+--- a/cpp/kernels/PluginJitKernels/pluginJitCompiler.cpp
++++ b/cpp/kernels/PluginJitKernels/pluginJitCompiler.cpp
+@@ -94,11 +94,16 @@ std::vector<uint8_t> compilePluginJitKernel(
+     }
+ 
+     std::vector<char const*> options;
+-    options.reserve(optionStrings.size());
++    options.reserve(optionStrings.size() + 1);
+     for (std::string const& option : optionStrings)
+     {
+         options.push_back(option.c_str());
+     }
++#ifdef EDGELLM_NVRTC_CUDA_INCLUDE_DIR
++    // CUDA < 12.9: cuda_fp16.h includes vector_types.h even under NVRTC, and that header is not one of the
++    // embedded sources, so let NVRTC resolve non-embedded includes from the toolkit headers.
++    options.push_back("--include-path=" EDGELLM_NVRTC_CUDA_INCLUDE_DIR);
++#endif
+ 
+     nvrtcProgram rawProgram{};
+     checkNvrtc(nvrtcCreateProgram(&rawProgram, embedded.mainSource, embedded.mainSourceName,

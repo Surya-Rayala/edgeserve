@@ -1,0 +1,179 @@
+diff --git a/tensorrt_edgellm/checkpoint/repacking.py b/tensorrt_edgellm/checkpoint/repacking.py
+index 265ada3cc1a4..5339f0f165fc 100644
+--- a/tensorrt_edgellm/checkpoint/repacking.py
++++ b/tensorrt_edgellm/checkpoint/repacking.py
+@@ -23,6 +23,7 @@ in-place on ``module._buffers`` or return new tensors; they are called by
+ """
+ 
+ import logging
++import os
+ from typing import Iterable, NamedTuple, Optional, Tuple
+ 
+ import numpy as np
+@@ -66,8 +67,48 @@ NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT = 128
+ # ---------------------------------------------------------------------------
+ 
+ 
++# The int4 GEMM kernel computes ``(nibble - 8) * scale`` and has no zero-point input. Folding an
++# asymmetric zero point into the nibbles (``nibble - zero + 8``) clips every code that then leaves
++# [0, 15]. Instead, the nibbles are kept as they are and the rest of the weight,
++# ``(8 - zero) * scale``, is added by a small per-group GEMM (``zp_correction``, see linear.py):
++#     (nibble - zero) * scale = (nibble - 8) * scale + (8 - zero) * scale
++# EDGELLM_FOLD_ZERO_POINTS=1 restores the folding.
++_EXACT_ZERO_POINTS = os.environ.get("EDGELLM_FOLD_ZERO_POINTS", "") != "1"
++
++
++def awq_zero_points(qzeros: torch.Tensor, out_features: int) -> torch.Tensor:
++    """AWQ ``qzeros`` ``[in//g, out//8]`` int32 -> zero points ``[in//g, out]`` int32."""
++    qz = qzeros.cpu().to(torch.int32)
++    zeros = torch.zeros(qz.shape[0], out_features, dtype=torch.int32)
++    for k, channel in enumerate([0, 2, 4, 6, 1, 3, 5, 7]):  # AutoAWQ's nibble order
++        zeros[:, channel::8] = (qz >> (4 * k)) & 0xF
++    return zeros
++
++
++def gptq_zero_points(qzeros: torch.Tensor, out_features: int, num_groups: int,
++                     zero_point_offset: int) -> torch.Tensor:
++    """GPTQ ``qzeros`` ``[groups, out//8]`` int32 -> actual zero points ``[groups, out]`` int32 (8 when the
++    checkpoint stores none)."""
++    qz = qzeros.cpu().to(torch.int32)
++    if qz.numel() == 0:
++        return torch.full((num_groups, out_features), 8, dtype=torch.int32)
++    zeros = torch.zeros(qz.shape[0], out_features, dtype=torch.int32)
++    for k in range(8):
++        zeros[:, k::8] = (qz >> (4 * k)) & 0xF
++    return zeros + int(zero_point_offset)
++
++
++def zero_point_correction(zeros: torch.Tensor, scales: torch.Tensor,
++                          group_size: int) -> torch.Tensor:
++    """``(8 - zero) * scale * group_size`` ``[groups, out]`` float16: multiplied by the per-group mean of the
++    activations, it adds the zero-point part of each weight."""
++    return ((8 - zeros).to(torch.float32) * scales.cpu().to(torch.float32) *
++            group_size).to(torch.float16)
++
++
+ def repack_awq_to_plugin(qweight: torch.Tensor,
+-                         qzeros: torch.Tensor) -> torch.Tensor:
++                         qzeros: torch.Tensor,
++                         fold_zeros: bool = True) -> torch.Tensor:
+     """Repack AWQ qweight from [in, out//8] int32 to [out//2, in] int8.
+ 
+     AWQ packs 8 int4 nibbles per int32 along the output axis::
+@@ -115,7 +156,8 @@ def repack_awq_to_plugin(qweight: torch.Tensor,
+ 
+     # Adjust nibbles: kernel does (nibble - 8) * scale; AWQ does (nibble - qzero) * scale
+     # So adjusted = nibble - qzero + 8 -> kernel result = (adjusted - 8) = (nibble - qzero)
+-    nibbles = (nibbles - zeros_expanded + 8).clamp(0, 15)
++    if fold_zeros:
++        nibbles = (nibbles - zeros_expanded + 8).clamp(0, 15)
+ 
+     # Transpose [in, out] -> [out, in] = [N, K] for pack_intweights
+     nibbles_nk = nibbles.t().contiguous().numpy().astype(np.int16)  # [N, K]
+@@ -270,6 +312,7 @@ def repack_gptq_to_plugin(
+     qzeros: torch.Tensor,
+     g_idx: Optional[torch.Tensor] = None,
+     zero_point_offset: int = 1,
++    fold_zeros: bool = True,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     """Repack GPTQ ``qweight`` ``[in//8, out]`` int32 to plugin ``[out//2, in]`` int8.
+ 
+@@ -332,8 +375,9 @@ def repack_gptq_to_plugin(
+     # actual_zero = stored_zero + zero_point_offset.
+     # Adjust nibbles: kernel does (nibble - 8) * scale; GPTQ does (nibble - actual_zero) * scale
+     # -> repacked = nibble - (stored_zero + zero_point_offset) + 8
+-    nibbles = (nibbles - zeros_expanded - int(zero_point_offset) + 8).clamp(
+-        0, 15)
++    if fold_zeros:
++        nibbles = (nibbles - zeros_expanded - int(zero_point_offset) +
++                   8).clamp(0, 15)
+ 
+     # Gather K rows by group (identity order when ``g_idx`` is sequential).
+     nibbles, permute_idx = _gather_rows_by_gidx_order(nibbles, g_idx_t,
+@@ -541,7 +585,15 @@ def _repack_awq_weights(model: nn.Module) -> None:
+             qw = module._buffers.get("qweight")
+             qz = module._buffers.get("qzeros")
+             if qw is not None and qw.dtype == torch.int32 and qz is not None:
+-                module._buffers["qweight"] = repack_awq_to_plugin(qw, qz)
++                sc = module._buffers.get("scales")
++                zeros = awq_zero_points(qz, qw.shape[1] * 8)
++                exact = (_EXACT_ZERO_POINTS and sc is not None
++                         and bool((zeros != 8).any()))
++                module._buffers["qweight"] = repack_awq_to_plugin(
++                    qw, qz, fold_zeros=not exact)
++                if exact:
++                    module._buffers["zp_correction"] = zero_point_correction(
++                        zeros, sc, module.group_size).to(qw.device)
+                 logger.debug("Repacked AWQ qweight: %s -> %s", list(qw.shape),
+                              list(module._buffers["qweight"].shape))
+             sc = module._buffers.get("scales")
+@@ -559,10 +611,25 @@ def _repack_gptq_weights(model: nn.Module) -> None:
+             qz = module._buffers.get("qzeros")
+             if qw is not None and qw.dtype == torch.int32 and qz is not None:
+                 g_idx_buf = module._buffers.get("g_idx")
+-                packed, perm = repack_gptq_to_plugin(
+-                    qw, qz, g_idx_buf, getattr(module, "zero_point_offset", 1))
++                offset = getattr(module, "zero_point_offset", 1)
++                sc = module._buffers.get("scales")
++                zeros = gptq_zero_points(qz, qw.shape[1],
++                                         qw.shape[0] * 8 // module.group_size,
++                                         offset)
++                exact = (_EXACT_ZERO_POINTS and sc is not None
++                         and bool((zeros != 8).any()))
++                packed, perm = repack_gptq_to_plugin(qw,
++                                                     qz,
++                                                     g_idx_buf,
++                                                     offset,
++                                                     fold_zeros=not exact)
+                 module._buffers["qweight"] = packed
+                 module._buffers["int4_act_perm"] = perm
++                if exact:
++                    # The kernel reads K in group order (rows gathered by g_idx), and so do the group means
++                    # of the permuted activations: zeros and scales are already in group order.
++                    module._buffers["zp_correction"] = zero_point_correction(
++                        zeros, sc, module.group_size).to(qw.device)
+                 logger.debug("Repacked GPTQ qweight: %s -> %s", list(qw.shape),
+                              list(packed.shape))
+             sc = module._buffers.get("scales")
+diff --git a/tensorrt_edgellm/models/linear.py b/tensorrt_edgellm/models/linear.py
+index 2aa6f70da58a..df726b4e6d8d 100644
+--- a/tensorrt_edgellm/models/linear.py
++++ b/tensorrt_edgellm/models/linear.py
+@@ -55,6 +55,15 @@ def _require_fp16_input(hidden_states: torch.Tensor, layer_name: str) -> None:
+             f"{layer_name} expects float16 input, got {hidden_states.dtype}")
+ 
+ 
++def _zero_point_term(hidden_states: torch.Tensor, correction: torch.Tensor,
++                     group_size: int) -> torch.Tensor:
++    """The zero-point part of asymmetric INT4 weights (see ``checkpoint/repacking.py``): the per-group mean of
++    the activations (in float32, so large activations cannot overflow) times ``(8 - zero) * scale * group``."""
++    means = hidden_states.float().unflatten(
++        -1, (hidden_states.shape[-1] // group_size, group_size)).mean(-1)
++    return torch.matmul(means.to(torch.float16), correction)
++
++
+ def _int4_groupwise_gemm_dispatch(hidden_states, qweight, scales, gemm_n,
+                                   gemm_k, group_size):
+     """Emit the INT4 groupwise GEMM custom op for the selected plugin backend.
+@@ -573,6 +582,10 @@ class AWQLinear(LinearBase):
+             self.in_features,
+             self.group_size,
+         )
++        correction = self._buffers.get("zp_correction")
++        if correction is not None:
++            out = out + _zero_point_term(hidden_states, correction,
++                                         self.group_size)
+         if self.bias is not None:
+             out = out + self.bias
+         return out
+@@ -796,6 +809,10 @@ class GPTQLinear(LinearBase):
+             self.in_features,
+             self.group_size,
+         )
++        correction = self._buffers.get("zp_correction")
++        if correction is not None:  # hidden_states is in the kernel's (group) channel order here
++            out = out + _zero_point_term(hidden_states, correction,
++                                         self.group_size)
+         if self.bias is not None:
+             out = out + self.bias
+         return out

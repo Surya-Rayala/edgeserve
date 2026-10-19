@@ -1,0 +1,11 @@
+# Source distribution: the package (with its native sources), docs and tests. Model folders,
+# outputs, build trees and secrets never ship.
+include LICENSE NOTICE README.md pyproject.toml
+graft edgeserve/native
+graft edgeserve/export_patches
+graft docs
+graft tests
+prune models
+prune outputs
+prune build
+global-exclude __pycache__ *.py[cod] *.so *.o *.engine *.log *.key *.pem *.env

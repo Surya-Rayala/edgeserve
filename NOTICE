@@ -1,0 +1,12 @@
+edgeserve
+Copyright 2026 The edgeserve Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+edgeserve builds NVIDIA TensorRT Edge-LLM (https://github.com/NVIDIA/TensorRT-Edge-LLM,
+Copyright (c) 2025, NVIDIA CORPORATION, Apache License 2.0) from source when
+`edgeserve setup` runs. TensorRT Edge-LLM itself is not included in this package; the
+patches to it in edgeserve/native/edgellm/patches are modifications of that project and
+are distributed under the same license.
+
+TensorRT, CUDA and Jetson are trademarks of NVIDIA Corporation.

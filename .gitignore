@@ -1,0 +1,24 @@
+# Model folders hold large, often licence-restricted weights: never commit them.
+models/*
+!models/README.md
+
+# Build output and environments
+build/
+dist/
+.venv/
+*.egg-info/
+
+# Engines, request records and local secrets
+*.engine
+outputs/
+*.pem
+*.key
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Logs
+*.log
