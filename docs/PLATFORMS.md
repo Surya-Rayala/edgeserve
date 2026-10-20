@@ -42,6 +42,25 @@ Recommended settings, most important on an 8 GB Orin Nano:
   the upgrade, run `edgeserve setup` again. It rebuilds the runtime if CUDA or TensorRT changed,
   and engines are rebuilt automatically when anything they depend on changed.
 
+### Free memory on a Jetson
+
+The GPU has no memory of its own: the model, its engine build and everything else running share the
+board's RAM. Before serving, and especially before a model's first start (which builds its engine),
+free what you do not need:
+
+```bash
+free -h                              # "available" is what a model can use
+ps -eo rss,comm --sort=-rss | head   # the programs that use the most memory (in KB)
+docker ps                            # stop containers you do not need: docker stop <name>
+edgeserve info --model <model-dir>   # compare memory_estimate_gib.total with memory_available_gib
+```
+
+Run without the desktop (above), and close IDE remote sessions (VS Code or Cursor servers), notebooks
+and other GPU programs on the board: each can hold 0.5–1 GB. Serve one model at a time. If an engine
+build or load still fails while `free -h` shows enough available memory, release the file caches
+first: `sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches`. Sizes per model, and how to make a
+model fit: [MODELS.md](MODELS.md#memory).
+
 ### Moving to JetPack 7.2.1
 
 JetPack 7.2.1 is the official Edge-LLM platform for Orin. Moving there is a reflash with

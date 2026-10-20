@@ -15,7 +15,7 @@ Run LLMs on NVIDIA Jetson and NVIDIA GPUs behind an OpenAI-compatible API, using
   client its own key.
 
 **Steps:** [1. Install](#1-install) · [2. Build the GPU runtime](#2-build-the-gpu-runtime) ·
-[3. Export a model](#3-export-a-model) · [4. Serve](#4-serve) ([free memory](#free-memory-on-a-jetson)) ·
+[3. Export a model](#3-export-a-model) · [4. Serve](#4-serve) ·
 [5. Send requests](#5-send-requests) ·
 [6. Access from other machines](#6-access-from-other-machines). Also: [request format](#request-format),
 [many requests at once](#many-requests-at-once), [saved requests](#saved-requests),
@@ -135,8 +135,8 @@ supported models and memory in [docs/MODELS.md](https://github.com/Surya-Rayala/
 
 ## 4. Serve
 
-On a Jetson, [free memory](#free-memory-on-a-jetson) first: the model shares the board's memory with
-everything else running.
+On a Jetson, the model shares the board's memory with everything else running: close what you do not
+need first ([how](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/PLATFORMS.md#free-memory-on-a-jetson)).
 
 ```bash
 edgeserve serve --model <model-dir>
@@ -160,28 +160,6 @@ The options you will use most:
 
 The queue and per-client limits are in [many requests at once](#many-requests-at-once); every option,
 and how to set it permanently, in [options and settings](#options-and-settings).
-
-### Free memory on a Jetson
-
-On Jetson the GPU has no memory of its own: the model, its engine build and everything else
-running share the board's RAM. Before serving (and especially before the first start, which
-builds the engine), free what you do not need:
-
-```bash
-free -h                                           # "available" is what a model can use
-ps -eo rss,comm --sort=-rss | head                # the programs that use the most memory (in KB)
-sudo systemctl isolate multi-user.target          # stop the desktop until the next reboot (about 0.8 GB)
-sudo systemctl set-default multi-user.target      # keep it stopped after reboots (graphical.target undoes it)
-docker ps                                         # stop containers you do not need: docker stop <name>
-edgeserve info --model <model-dir>                # compare memory_estimate_gib.total with memory_available_gib
-```
-
-Also close IDE remote sessions (VS Code or Cursor servers), notebooks and other GPU programs on
-the board: each can hold 0.5–1 GB. Serve one model at a time. If an engine build or load still
-fails while `free -h` shows enough available memory, release the file caches first:
-`sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches`. Sizes per model, and how to make a
-model fit: [docs/MODELS.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/MODELS.md#memory);
-power modes and swap: [docs/PLATFORMS.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/PLATFORMS.md#jetson).
 
 ## 5. Send requests
 
@@ -360,11 +338,23 @@ edgeserve keys list             # the clients that have keys (never the keys)
 edgeserve keys remove <name>    # that key stops working at once
 ```
 
-Give each client the key that `edgeserve keys add` printed, instead of the one step 6 copies:
-`export EDGESERVE_API_KEY=es-…`. Keys work at once, also on a running server. Once one exists, every
-`/v1/` request needs a key, from the server itself too (`edgeserve check` and `edgeserve batch` send
-`EDGESERVE_API_KEY`). edgeserve keeps only a hash of each key, in `~/.config/edgeserve/client-keys.json`;
-the key of `edgeserve setup --network` keeps working as client `default`.
+Give each client the key that `edgeserve keys add` printed, instead of the one step 6 copies. To move
+it without copying it by hand, save it on the server and fetch it from the client device over SSH
+(which deletes the file again):
+
+```bash
+edgeserve keys add <name> | grep -o 'es-[A-Za-z0-9_-]*' > ~/<name>.key && chmod 600 ~/<name>.key    # on the server
+export EDGESERVE_API_KEY=$(ssh <user>@<server-ip> "cat <name>.key && rm <name>.key")              # on the client
+```
+
+On Windows (PowerShell) the client line is
+`$env:EDGESERVE_API_KEY = ssh <user>@<server-ip> "cat <name>.key && rm <name>.key"`. The client also
+needs `edgeserve-ca.crt`, copied as in step 6.
+
+Keys work at once, also on a running server. Once one exists, every `/v1/` request needs a key, from
+the server itself too (`edgeserve check` and `edgeserve batch` send `EDGESERVE_API_KEY`). edgeserve
+keeps only a hash of each key, in `~/.config/edgeserve/client-keys.json`; the key of
+`edgeserve setup --network` keeps working as client `default`.
 
 - **Each client on its own:** saved requests show their client, a client key reads only its own
   records (the `default` key reads all), a request ID belongs to the client that used it first, and the
@@ -588,7 +578,7 @@ settings folder), `EDGESERVE_API_KEY` on a client (the key `check` and `batch` s
 | `edgeserve setup` lists missing packages | install them with the `apt` line it prints, then run it again |
 | "the GPU runtime is not built yet" or "… from other sources" | run `edgeserve setup` |
 | `/health/ready` says `building_engine` | normal on the first start of a model or new limits |
-| "not enough memory", or the engine build "ran out of memory" | [free memory](#free-memory-on-a-jetson) on a Jetson; use an INT4 or a smaller model, lower `--max-input-len`, keep `--max-batch-size 1` |
+| "not enough memory", or the engine build "ran out of memory" | [free memory](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/PLATFORMS.md#free-memory-on-a-jetson) on a Jetson; use an INT4 or a smaller model, lower `--max-input-len`, keep `--max-batch-size 1` |
 | "exported with TensorRT Edge-LLM x.y" | export the model again with `edgeserve export` |
 | "is a Hugging Face checkpoint, not an exported model" | export it first: `edgeserve export <checkpoint-dir> <model-dir>`, then serve `<model-dir>` |
 | "is a GGUF file", "holds GGUF files" or "holds an ONNX model made by another tool" | export the Hugging Face checkpoint the model was made from |

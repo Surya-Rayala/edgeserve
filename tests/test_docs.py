@@ -122,6 +122,9 @@ def _edgeserve_commands(page: Path, inline: bool = False) -> list[list[str]]:
                 words = words[1:]
             if words and Path(words[0]).name == "edgeserve":
                 args = words[1:]
+                cut = next((i for i, word in enumerate(args) if word in ("|", "||", "&&", ";", "&")
+                            or word.startswith((">", "<", "2>"))), None)
+                args = args if cut is None else args[:cut]
                 commands.append(args[:args.index("--")] if "--" in args else args)  # after --: the exporter's
     return commands
 
