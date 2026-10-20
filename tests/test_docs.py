@@ -288,13 +288,16 @@ def test_the_readme_network_examples_work(example_model, fake_native, tmp_path):
     with edgeserve_server(example_model, fake_native, network=True) as url:
         key = config.read()["EDGESERVE_API_KEY"]
         shutil.copy(config.config_dir() / "edgeserve-ca.crt", tmp_path / "edgeserve-ca.crt")
-        curl = next(line for line in client_block.splitlines() if line.startswith("curl"))
-        out = _run_bash(curl.replace("https://<server-ip>:8000", url), tmp_path, EDGESERVE_API_KEY=key)
+        # every curl command of the Linux/macOS block (scp and the key come from the test instead)
+        curls = "\n".join(line for line in client_block.splitlines() if not line.startswith(("scp ", "export ")))
+        out = _run_bash(curls.replace("https://<server-ip>:8000", url), tmp_path, EDGESERVE_API_KEY=key)
         assert "qwen2.5-0.5b-instruct-awq" in out
+        assert '"request_id":"client-001"' in out.replace(" ", "")  # the chat request, with its ID
         script = tmp_path / "client.py"
         script.write_text(python.replace("https://<server-ip>:8000", url)
                           + "\nprint(client.models.list().data[0].id)\n")
         result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=120, cwd=tmp_path,
                                 env={**os.environ, "EDGESERVE_API_KEY": key})
         assert result.returncode == 0, result.stderr
-        assert result.stdout.strip() == "qwen2.5-0.5b-instruct-awq"
+        lines = result.stdout.strip().splitlines()
+        assert lines[0].startswith("client-003 ") and lines[-1] == "qwen2.5-0.5b-instruct-awq"

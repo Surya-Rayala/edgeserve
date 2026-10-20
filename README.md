@@ -14,9 +14,9 @@ Run LLMs on NVIDIA Jetson and NVIDIA GPUs behind an OpenAI-compatible API, using
 **Steps:** [1. Install](#1-install) · [2. Build the GPU runtime](#2-build-the-gpu-runtime) ·
 [3. Export a model](#3-export-a-model) · [4. Serve](#4-serve) ([free memory](#free-memory-on-a-jetson)) ·
 [5. Send requests](#5-send-requests) ·
-[6. Access from other machines](#6-access-from-other-machines). Also: [your own models](#your-own-models),
-[batch jobs](#batch-jobs), [service](#run-as-a-service), [uninstall](#uninstall),
-[commands](#command-reference), [options and settings](#options-and-settings),
+[6. Access from other machines](#6-access-from-other-machines). Also: [request format](#request-format),
+[your own models](#your-own-models), [batch jobs](#batch-jobs), [service](#run-as-a-service),
+[uninstall](#uninstall), [commands](#command-reference), [options and settings](#options-and-settings),
 [troubleshooting](#troubleshooting), [documentation](#documentation).
 
 In the commands below, replace each `<placeholder>` with your own value.
@@ -195,11 +195,61 @@ print(reply.choices[0].message.content)
 print(reply.model_extra["metrics"]["decode_tokens_per_s"], "tokens/s")
 ```
 
-- `X-Request-Id` is optional. Your ID comes back with the response, and with
-  `edgeserve serve --output-dir <output-dir>` every request is saved as
-  `<output-dir>/records/<id>.json`, with its metrics.
-- For streaming, send `"stream": true` (`stream=True` in the SDK).
-- Every field, error code and metric: [docs/API.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/API.md).
+### Request format
+
+A chat request (`POST /v1/chat/completions`) is a JSON object; only `messages` is required:
+
+```json
+{
+  "messages": [
+    {"role": "system", "content": "Summarize the text in two sentences."},
+    {"role": "user", "content": "<the text>"}
+  ],
+  "max_tokens": 160,
+  "temperature": 0,
+  "request_id": "meeting-0001",
+  "metadata": {"source": "room-12"}
+}
+```
+
+| Field | Meaning | Default |
+|---|---|---|
+| `messages` | the conversation, oldest first. `role`: `system` (instructions), `user`, `assistant` (an earlier answer) or `developer` (same as `system`); `content`: the text. Up to 64 messages of up to 128 KB each | required |
+| `max_tokens` | the longest answer, in tokens (`max_completion_tokens` means the same) | `--max-new-tokens` (the model's `generation_config.json`, else 512) |
+| `temperature` | randomness, 0 to 2. 0 always picks the most likely next token: the same answer every time | the model's `generation_config.json`, else 0 |
+| `top_p`, `top_k` | when sampling, choose only among the most likely tokens: those that make up `top_p` (above 0, up to 1) of the probability, or the `top_k` (up to 1024) most likely | the model's `generation_config.json`, else no limit |
+| `seed` | a number that makes sampling repeatable | random, saved in the record |
+| `stop` | a string, or up to 4, that ends the answer | none |
+| `stream` | `true`: send the answer in pieces as it is generated; add `"stream_options": {"include_usage": true}` for a last piece with the token counts and metrics | `false` |
+| `request_id` | your ID for this request (the same as the `X-Request-Id` header) | `req_<random hex>` |
+| `metadata` | up to 16 string pairs of your own (keys up to 64 characters, values up to 512), saved in the record | none |
+| `return_record` | `true`: the response also holds the full record, with per-token timings (not with `stream`) | `false` |
+| `model` | the served model's name, as `GET /v1/models` lists it; optional | the served model |
+| `n` (only 1), `frequency_penalty` and `presence_penalty` (only 0), `logprobs` (only `false`), `user`, `safety_identifier`, `prompt_cache_key`, a message's `name` | accepted so that every OpenAI client works; they change nothing | — |
+
+A completion request (`POST /v1/completions`) takes `prompt`, one string with the model's chat
+template already applied, instead of `messages`. Any other field is refused with HTTP 400, never
+ignored.
+
+**Request IDs.** Send your ID in the `X-Request-Id` header or the `request_id` field: 1 to 512
+printable ASCII characters (with letters, digits, `.`, `_` and `-`, the record's file name is the ID
+itself). Without one, the server makes one (`req_…`). The ID comes back in the response's
+`request_id` and `id` (`chatcmpl-<id>`) and in its `X-Request-Id` header. With
+`edgeserve serve --output-dir <output-dir>`, every request is saved as
+`<output-dir>/records/<id>.json`, which `GET /v1/records/<id>` also returns. A request with the ID
+of one that is still running gets HTTP 409.
+
+The response is OpenAI's, plus `request_id` and `metrics`:
+
+```json
+{"id": "chatcmpl-meeting-0001", "object": "chat.completion", "model": "<model name>",
+ "choices": [{"index": 0, "message": {"role": "assistant", "content": "…"}, "finish_reason": "stop"}],
+ "usage": {"prompt_tokens": 162, "completion_tokens": 72, "total_tokens": 234},
+ "request_id": "meeting-0001", "metrics": {"ttft_ms": 303, "decode_tokens_per_s": 25.9, …}}
+```
+
+For streaming, send `"stream": true` (`stream=True` in the SDK). Every field, error code and
+metric: [docs/API.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/API.md).
 
 ## 6. Access from other machines
 
@@ -216,17 +266,44 @@ This creates three things in `~/.config/edgeserve/`:
 
 Restart `edgeserve serve`. From then on the server speaks only HTTPS and every `/v1/` request needs
 the key, on this machine too (`edgeserve check` finds both by itself), so the `http://` examples of
-step 5 stop working. Then, on each client machine (`<server-ip>` is the server's IP address, which
-`edgeserve setup --network` prints; `<user>` is your user name on the server):
+step 5 stop working.
+
+**On each client machine** you need the server's `edgeserve-ca.crt` and the key. Below,
+`<server-ip>` is the server's IP address (`edgeserve setup --network` prints it) and `<user>` is your
+user name on the server.
+
+Linux and macOS (Terminal):
 
 ```bash
 scp <user>@<server-ip>:.config/edgeserve/edgeserve-ca.crt .
 export EDGESERVE_API_KEY=<the key>
 curl --cacert edgeserve-ca.crt -H "Authorization: Bearer $EDGESERVE_API_KEY" https://<server-ip>:8000/v1/models
+curl --cacert edgeserve-ca.crt https://<server-ip>:8000/v1/chat/completions \
+  -H "Authorization: Bearer $EDGESERVE_API_KEY" -H "Content-Type: application/json" -H "X-Request-Id: client-001" \
+  -d '{"messages": [{"role": "user", "content": "What is a GPU? Answer in one sentence."}], "max_tokens": 100}'
 ```
 
-Other requests work as in [step 5](#5-send-requests), with `https://<server-ip>:8000`, the key and
-the CA file. In Python:
+Windows (PowerShell; `scp` and `curl.exe` come with Windows 10 and 11):
+
+```powershell
+scp <user>@<server-ip>:.config/edgeserve/edgeserve-ca.crt .
+$env:EDGESERVE_API_KEY = "<the key>"
+curl.exe --ssl-no-revoke --cacert edgeserve-ca.crt -H "Authorization: Bearer $env:EDGESERVE_API_KEY" https://<server-ip>:8000/v1/models
+Set-Content -Encoding ascii request.json '{"messages": [{"role": "user", "content": "What is a GPU? Answer in one sentence."}], "max_tokens": 100}'
+curl.exe --ssl-no-revoke --cacert edgeserve-ca.crt https://<server-ip>:8000/v1/chat/completions `
+  -H "Authorization: Bearer $env:EDGESERVE_API_KEY" -H "Content-Type: application/json" -H "X-Request-Id: client-002" `
+  -d "@request.json"
+```
+
+Type `curl.exe`, not `curl` (in Windows PowerShell, `curl` is a different command).
+`--ssl-no-revoke` is needed because Windows otherwise asks whether the certificate was revoked,
+which a private CA cannot answer. The request body goes in a file because PowerShell changes the
+quotes inside inline JSON.
+
+Python, on any of them: make a virtual environment with the OpenAI SDK
+(`python3 -m venv <client-venv>` and `<client-venv>/bin/pip install openai httpx`; on Windows
+`py -m venv <client-venv>` and `<client-venv>\Scripts\pip install openai httpx`), then run this
+with its Python:
 
 ```python
 import os, ssl
@@ -235,7 +312,17 @@ from openai import OpenAI
 
 client = OpenAI(base_url="https://<server-ip>:8000/v1", api_key=os.environ["EDGESERVE_API_KEY"],
                 http_client=httpx.Client(verify=ssl.create_default_context(cafile="edgeserve-ca.crt")))
+reply = client.chat.completions.create(
+    model=client.models.list().data[0].id,
+    messages=[{"role": "user", "content": "What is a GPU? Answer in one sentence."}],
+    max_tokens=100,
+    extra_headers={"X-Request-Id": "client-003"},
+)
+print(reply.model_extra["request_id"], reply.choices[0].message.content)
 ```
+
+Every other request works as in [step 5](#5-send-requests), with `https://<server-ip>:8000`, the
+key and the CA file.
 
 - **New key:** delete the `EDGESERVE_API_KEY=` line in `~/.config/edgeserve/edgeserve.env`, run
   `edgeserve setup --network` (it prints the new key) and restart the server. You can also write
