@@ -29,18 +29,24 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from edgeserve import settings as limits
+from edgeserve.keys import KeyStore
 from edgeserve.engine import BuildProfile, EngineCache, EngineError, EngineInfo, NativeBuild
 from edgeserve.hardware import Platform, PlatformError, probe, probe_gpu, refresh_clocks
-from edgeserve.metrics import PrometheusMetrics, RecordContext, build_record
+from edgeserve.metrics import RECORD_SCHEMA, PrometheusMetrics, RecordContext, build_record
 from edgeserve.model import ModelError, ModelInfo, estimate_memory, fingerprint, load_model, model_name
 from edgeserve.records import OutputDir
-from edgeserve.scheduler import Job, Scheduler
-from edgeserve.settings import Settings
+from edgeserve.scheduler import AdmissionError, Job, RateLimiter, Scheduler
+from edgeserve.settings import Settings, is_loopback
 from edgeserve.telemetry import Telemetry
 from edgeserve.worker import WorkerClient, WorkerError
 
 log = logging.getLogger("edgeserve")
 request_log = logging.getLogger("edgeserve.requests")
+
+# Saved refusals: at most this many waiting for the records thread, and this many a minute per client (a
+# refusal costs its sender nothing, so it must not cost the server unbounded memory or disk).
+_MAX_PENDING_REFUSALS = 32
+_SAVED_REFUSALS_PER_MINUTE = 60
 
 # GPUs with kernels for Edge-LLM's INT4 GEMM plugin (CuTe DSL); other GPUs need a different export.
 INT4_PLUGIN_SMS = frozenset({80, 86, 87, 89, 100, 101, 110, 120, 121})
@@ -63,8 +69,13 @@ class Service:
         self.worker: WorkerClient | None = None
         self.telemetry: Telemetry | None = None
         self.scheduler: Scheduler | None = None
-        self.output: OutputDir | None = None
+        self.output: OutputDir | None = None  # opened by start(), before the first request
         self.ctx: RecordContext | None = None
+        # The API keys (EDGESERVE_API_KEY, edgeserve keys); a server on the network always asks for one.
+        self.keys = KeyStore(settings.api_key, always_required=not is_loopback(settings.host) or settings.client_keys)
+        self.rate_limiter = RateLimiter(settings.client_rate_limit)
+        self._saved_refusals = RateLimiter(_SAVED_REFUSALS_PER_MINUTE)
+        self._pending_refusals = 0
         self.started_at = time.time()
         self.model_name = model_name(settings.model)  # what clients call it (before the model is loaded)
         self.prometheus = PrometheusMetrics(model_name=self.model_name)
@@ -89,6 +100,13 @@ class Service:
         return self.state == "ready" and self.worker is not None and self.worker.alive
 
     async def start(self) -> None:
+        if self.settings.output_dir and self.output is None:
+            try:  # before the first request, so requests refused while the server starts are saved too
+                self.output = OutputDir(self.settings.output_dir)
+            except OSError as e:
+                self.set_state("failed", f"cannot use the output folder {self.settings.output_dir}: {e}")
+                log.error("startup failed: %s", self.detail)
+                return
         self._tasks.append(asyncio.create_task(self._startup(), name="startup"))
 
     async def _startup(self) -> None:
@@ -164,15 +182,15 @@ class Service:
         self.ctx = RecordContext(model=self.model, engine=self.engine, platform=self.platform,
                                  telemetry=self.telemetry, served_name=self.model.name)
         self.prometheus.set_model_info(self.ctx)
-        if s.output_dir:
-            self.output = OutputDir(s.output_dir)
         self.scheduler = Scheduler(
             get_worker=lambda: self.worker if self.state in ("ready", "draining") else None,
             max_batch_size=self.engine.profile.max_batch_size,
             kv_capacity=self.engine.profile.kv_capacity,
-            queue_size=limits.QUEUE_SIZE,
-            queue_timeout_s=limits.QUEUE_TIMEOUT_S,
+            queue_size=s.queue_size,
+            queue_timeout_s=s.queue_timeout,
             on_change=self._queue_changed,
+            request_timeout_s=s.request_timeout,
+            max_client_requests=s.max_client_requests,
         )
 
     async def _start_worker(self) -> None:
@@ -306,14 +324,57 @@ class Service:
             "prompt_tokens": record["usage"]["prompt_tokens"],
             "completion_tokens": record["usage"]["completion_tokens"], "ttft_ms": m.get("ttft_ms"),
             "tpot_ms": m.get("tpot_ms"), "e2e_ms": m.get("e2e_ms"), "energy_j": m.get("energy_j"),
-            "error": (error or {}).get("code") if error else None,
+            "error": (error or {}).get("code") if error else None, "client": job.client,
         }))
         if self.output is not None:
             body = response_body if response_body is not None else ({"error": error} if error else None)
-            line = {"id": job.attempt_id, "custom_id": job.custom_id,
+            line = {"id": job.attempt_id, "custom_id": job.custom_id, "client": job.client,
                     "response": {"status_code": http_status, "request_id": job.attempt_id, "body": body},
                     "error": None}
             asyncio.get_running_loop().run_in_executor(self._records, self._persist, record, line)
+
+    def record_rejection(self, *, endpoint: str, client: str, custom_id: str | None, request: dict | None,
+                         metadata: dict | None, http_status: int, error: dict, t_arrival_unix_ns: int,
+                         in_progress: bool, named: bool = True) -> None:
+        """A request refused before it was queued (an authorized one): log it, and with --output-dir save it as a
+        results.jsonl line, and as records/<id>.json with status "rejected" when the client chose the ID
+        (``named``) and that ID has no record yet and is not in progress. At most _SAVED_REFUSALS_PER_MINUTE
+        refusals a minute per client are saved, and while the records thread is behind, none."""
+        attempt_id = self.new_attempt_id()
+        request_log.info(json.dumps({
+            "event": "request", "custom_id": custom_id, "attempt_id": attempt_id, "status": "rejected",
+            "http_status": http_status, "error": error.get("code"), "client": client,
+        }))
+        if self.output is None or self._pending_refusals >= _MAX_PENDING_REFUSALS:
+            return
+        try:
+            self._saved_refusals.take(client)
+        except AdmissionError:
+            return
+        record = {
+            "object": "edgeserve.record", "schema_version": RECORD_SCHEMA, "custom_id": custom_id,
+            "attempt_id": attempt_id, "status": "rejected", "http_status": http_status, "error": error,
+            "created": t_arrival_unix_ns // 1_000_000_000, "endpoint": endpoint, "metadata": metadata,
+            "client": client, "model": {"name": self.model_name}, "request": request,
+            "timestamps_ns": {"arrival": t_arrival_unix_ns, "finished": time.time_ns()},
+        }
+        line = {"id": attempt_id, "custom_id": custom_id, "client": client,
+                "response": {"status_code": http_status, "request_id": attempt_id, "body": {"error": error}},
+                "error": None}
+        write_file = custom_id is not None and named and not in_progress
+        self._pending_refusals += 1
+        future = asyncio.get_running_loop().run_in_executor(self._records, self._persist_rejection, record, line,
+                                                            write_file)
+        future.add_done_callback(lambda _: setattr(self, "_pending_refusals", self._pending_refusals - 1))
+
+    def _persist_rejection(self, record: dict, line: dict, write_file: bool) -> None:
+        try:
+            assert self.output is not None
+            if write_file and not self.output.record_path(record["custom_id"]).exists():
+                self.output.write_record(record)
+            self.output.append_result(line)
+        except Exception:
+            log.exception("could not save the refused request %s", record.get("custom_id"))
 
     def _persist(self, record: dict, line: dict) -> None:
         try:
@@ -336,6 +397,8 @@ class Service:
             entry.update({"max_model_len": p.kv_capacity - 1, "max_input_tokens": p.max_input_len,
                           "max_new_tokens": p.max_new_tokens, "max_batch_size": p.max_batch_size,
                           "quantization": self.model.quantization, "engine_fingerprint": self.engine.fingerprint})
+        if self.settings.max_client_requests:
+            entry["max_client_requests"] = self.settings.max_client_requests  # edgeserve batch keeps within it
         return entry
 
 

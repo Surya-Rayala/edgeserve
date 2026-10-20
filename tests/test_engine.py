@@ -339,7 +339,7 @@ async def test_records_of_one_id_are_written_in_commit_order(tmp_path, tiny_mode
 
     monkeypatch.setattr(OutputDir, "write_record", slow_first)
     for attempt in ("att_1", "att_2"):  # a failed attempt, then its immediate retry
-        service.commit(SimpleNamespace(custom_id="seg-1", attempt_id=attempt), fake_record("seg-1", attempt))
+        service.commit(SimpleNamespace(custom_id="seg-1", attempt_id=attempt, client="local"), fake_record("seg-1", attempt))
     await service.stop()
     results = tmp_path / "out" / "results.jsonl"
     for _ in range(100):  # both writes done (stop() waits for them; this test is about their order)
@@ -362,7 +362,7 @@ async def test_stop_writes_pending_records_before_returning(tmp_path, tiny_model
         return write_record(self, record)
 
     monkeypatch.setattr(OutputDir, "write_record", slow)
-    service.commit(SimpleNamespace(custom_id="last", attempt_id="att_9"), fake_record("last", "att_9"))
+    service.commit(SimpleNamespace(custom_id="last", attempt_id="att_9", client="local"), fake_record("last", "att_9"))
     await service.stop()  # under systemd the process is gone right after this (uvicorn re-raises SIGTERM)
     assert (tmp_path / "out" / "records" / "last.json").exists()
     assert "att_9" in (tmp_path / "out" / "results.jsonl").read_text()
@@ -406,7 +406,7 @@ async def test_stop_still_stops_the_worker_when_draining_fails(tmp_path, tiny_mo
         raise RuntimeError("the dispatcher died")
 
     monkeypatch.setattr(service.scheduler, "drain", broken_drain)
-    service.commit(SimpleNamespace(custom_id="last", attempt_id="att_1"), fake_record("last", "att_1"))
+    service.commit(SimpleNamespace(custom_id="last", attempt_id="att_1", client="local"), fake_record("last", "att_1"))
     await service.stop()
     assert not alive(worker_pid) and service.state == "stopped"
     assert "att_1" in (tmp_path / "out" / "results.jsonl").read_text()

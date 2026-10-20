@@ -77,7 +77,13 @@ its default. File values are never copied into the environment, so the API key d
 Edge-LLM processes (`NativeBuild.env()` also removes it from their environment when it was set
 there). The clients `edgeserve check` and `edgeserve batch` take the address, API key and CA
 certificate from the same file for this machine's own server, and never send that key to another
-host.
+host. Client keys (`edgeserve keys`, `edgeserve/keys.py`) live in
+`~/.config/edgeserve/client-keys.json` as SHA-256 hashes; the server's `KeyStore` rereads the file
+when its modification time, size or inode changes (and for 2 s after a write, as a key replaced
+within the file system's time resolution can keep all three), so added and removed keys take effect
+at once. It fails closed: once it has seen a client key, a key stays required until the server
+restarts, also when the last key is removed or the file breaks (then only the keys still written in
+it work).
 
 ## Why two processes
 
@@ -142,13 +148,20 @@ model are kept.
    (beyond that uvicorn answers new requests with a plain 503). JSON, validated against the OpenAI
    schema subset (unknown fields → 400). Client ID from `X-Request-Id` or `request_id` (else
    `req_<hex>`).
-2. **Admit.** Ready? Memory above the floor (256 MiB)? Same ID already in flight (409)? Queue space
-   (16 waiting, else 503 + `Retry-After`)? Then the worker counts prompt tokens with the model's own
+2. **Admit.** The client is the API key's name (or the address on a server without keys; this machine
+   is one client, and uvicorn's proxy headers are off, so `X-Forwarded-For` cannot change it).
+   Within `--client-rate-limit`, checked before the body is read (else 429)? Ready? Memory above the
+   floor (256 MiB)? Same ID already in flight, or (with client keys) used by another client (409)?
+   Fewer than `--max-client-requests` of this client waiting or running (else 429)?
+   Queue space (`--queue-size`, else 503 + `Retry-After`)? Then the worker counts prompt tokens with the model's own
    chat template (answered even while a generation runs) and the request is checked against the
    engine: prompt ≤ max input, prompt + max_tokens + 1 ≤ KV capacity (else 400
-   `context_length_exceeded`). Nothing is ever truncated silently.
-3. **Queue and dispatch.** FIFO; a request still waiting after 10 minutes fails with 503
-   `queue_timeout`. With `--max-batch-size N > 1` the oldest request is batched with up to N−1
+   `context_length_exceeded`). Nothing is ever truncated silently. A refusal by an authorized client
+   is saved (with `--output-dir`) as a `rejected` record that never replaces an earlier one.
+3. **Queue and dispatch.** FIFO; a request still waiting after `--queue-timeout` fails with 503
+   `queue_timeout`, and with `--request-timeout` a request not finished that long after its arrival
+   is dropped from the queue or cancelled at its next token (504 `time_limit_exceeded`). With
+   `--max-batch-size N > 1` the oldest request is batched with up to N−1
    later ones of the same kind (chat or formatted prompt) that have identical sampling settings and
    output limits. A sampling request without a seed gets a random one (Edge-LLM would
    otherwise draw the same random number at every step), recorded in its record.

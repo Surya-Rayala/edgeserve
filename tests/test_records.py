@@ -325,7 +325,7 @@ def _record(
 def test_summarize_empty() -> None:
     summary = summarize([])
     assert summary == {
-        "request_counts": {"total": 0, "completed": 0, "failed": 0, "cancelled": 0},
+        "request_counts": {"total": 0, "completed": 0, "failed": 0, "cancelled": 0, "rejected": 0},
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "window_s": None,
         "busy_s": None,
@@ -380,7 +380,7 @@ def test_summarize_mixed_records() -> None:
     unknown = {"custom_id": "u", "status": "weird", "usage": {"prompt_tokens": 1}}
     summary = summarize(iter([a, b, failed, cancelled, unknown, "not a record"]))  # type: ignore[list-item]
 
-    assert summary["request_counts"] == {"total": 5, "completed": 2, "failed": 1, "cancelled": 1}
+    assert summary["request_counts"] == {"total": 5, "completed": 2, "failed": 1, "cancelled": 1, "rejected": 0}
     assert summary["usage"] == {"prompt_tokens": 351, "completion_tokens": 155, "total_tokens": 506}
     assert summary["window_s"] == 4.0  # first arrival 1.0 s (a), last finished 5.0 s (b)
     assert summary["busy_s"] == 4.0  # the requests overlap: no idle time

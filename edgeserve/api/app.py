@@ -9,7 +9,6 @@ next decode step.
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import logging
 import secrets
@@ -18,7 +17,8 @@ from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -40,9 +40,11 @@ from edgeserve.api.protocol import (
     resolve_sampling,
     valid_request_id,
 )
+from edgeserve.keys import DEFAULT_CLIENT
 from edgeserve.metrics import response_metrics
 from edgeserve.scheduler import AdmissionError, Job
 from edgeserve.service import Service
+from edgeserve.settings import is_loopback
 from edgeserve.worker import WorkerError
 
 CHAT = "/v1/chat/completions"
@@ -58,8 +60,8 @@ def create_app(service: Service) -> FastAPI:
         yield
         await service.stop()
 
-    app = FastAPI(title="edgeserve", version=__version__, lifespan=lifespan,
-                  description="OpenAI-compatible server for TensorRT Edge-LLM engines")
+    app = FastAPI(title="edgeserve", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None,
+                  openapi_url=None, description="OpenAI-compatible server for TensorRT Edge-LLM engines")
     background: set[asyncio.Task] = set()
 
     @app.exception_handler(APIError)
@@ -77,15 +79,26 @@ def create_app(service: Service) -> FastAPI:
         error = APIError(exc.status_code, message, code=code, headers=headers)
         return error.response(_echo_id(request))
 
-    def authorize(request: Request) -> None:
-        key = service.settings.api_key
-        if not key:
-            return
-        scheme, _, token = request.headers.get("authorization", "").partition(" ")
-        if scheme.lower() != "bearer" or not hmac.compare_digest(token.strip().encode(), key.encode()):
-            raise APIError(401, "missing or invalid API key (send 'Authorization: Bearer <key>')",
-                           code="invalid_api_key", err_type="authentication_error",
-                           headers={"WWW-Authenticate": "Bearer"})
+    def authorize(request: Request) -> str:
+        """The client the request comes from: its API key's name, or its address on a server without keys (this
+        machine counts as one client, "local")."""
+        if not service.keys.required:
+            host = request.client.host if request.client else ""
+            client = "local" if not host or is_loopback(host) else host
+        else:
+            scheme, _, token = request.headers.get("authorization", "").partition(" ")
+            client = service.keys.client(token.strip()) if scheme.lower() == "bearer" else None
+            if client is None:
+                raise APIError(401, "missing or invalid API key (send 'Authorization: Bearer <key>')",
+                               code="invalid_api_key", err_type="authentication_error",
+                               headers={"WWW-Authenticate": "Bearer"})
+        request.state.client = client
+        return client
+
+    def operator(request: Request) -> None:
+        """/metrics and the API docs: with keys, only for a key, or for this machine itself."""
+        if service.keys.required and not _loopback(request):
+            authorize(request)
 
     # ------------------------------------------------------------------ probes and metadata
 
@@ -103,8 +116,19 @@ def create_app(service: Service) -> FastAPI:
                             headers={"Retry-After": "10"})
 
     @app.get("/metrics")
-    async def metrics() -> Response:
+    async def metrics(request: Request) -> Response:
+        operator(request)
         return Response(service.prometheus.render(), media_type=CONTENT_TYPE_LATEST)
+
+    @app.get("/openapi.json", include_in_schema=False)
+    async def openapi_schema(request: Request) -> JSONResponse:
+        operator(request)
+        return JSONResponse(app.openapi())
+
+    @app.get("/docs", include_in_schema=False)
+    async def docs(request: Request) -> HTMLResponse:
+        operator(request)
+        return get_swagger_ui_html(openapi_url="/openapi.json", title="edgeserve")
 
     @app.get("/v1/models")
     async def models(request: Request) -> JSONResponse:
@@ -122,18 +146,19 @@ def create_app(service: Service) -> FastAPI:
 
     @app.get("/v1/records/{custom_id:path}")
     async def record(request: Request, custom_id: str) -> JSONResponse:
-        authorize(request)
+        client = authorize(request)
         if service.output is None:
             raise APIError(404, "this server does not keep records (start it with --output-dir)", code="not_found")
         if not valid_request_id(custom_id):  # no record can have such an ID, and it may not be echoed in a header
             raise APIError(400, ID_RULE, code="invalid_request_id", param="custom_id")
         stored = await asyncio.to_thread(service.read_record, custom_id)
-        if stored is None:
+        if stored is None or not _may_read(service, client, stored):  # another client's record: as if absent
             raise APIError(404, f"no record for id {custom_id!r}", code="not_found")
         return JSONResponse(stored, headers={"X-Request-Id": custom_id})
 
     # HEAD as well (monitors and load balancers use it), kept out of the schema: one operation per path there
     for path, endpoint in (("/health", health), ("/health/ready", ready), ("/metrics", metrics),
+                           ("/openapi.json", openapi_schema), ("/docs", docs),
                            ("/v1/models", models), ("/v1/models/{model_id:path}", model),
                            ("/v1/records/{custom_id:path}", record)):
         app.add_api_route(path, endpoint, methods=["HEAD"], include_in_schema=False)
@@ -152,19 +177,39 @@ def create_app(service: Service) -> FastAPI:
         header = request.headers.get("x-request-id")
         if header is not None and valid_request_id(header):
             request.state.custom_id = header  # echoed on errors raised before the ID is fully checked
-        authorize(request)
-        raw = await _read_body(request)
-        t_arrival, t_arrival_unix = time.monotonic_ns(), time.time_ns()  # upload time is network time
-        body = _parse(raw, model_cls)
-        custom_id = _client_id(request, body)
-        request.state.custom_id = custom_id
-        job = await admit(body, endpoint, custom_id, t_arrival, t_arrival_unix)
+        client = authorize(request)  # requests without a valid key are not saved: anyone could send them
+        t_arrival_unix = time.time_ns()
+        body = custom_id = None
+        raw = b""
+        try:
+            try:
+                service.rate_limiter.take(client)
+            except AdmissionError as e:
+                reject(_rejection_reason(e))
+                raise APIError(e.status, str(e), code=e.code, err_type=e.err_type, retry_after=e.retry_after) from e
+            raw = await _read_body(request)
+            t_arrival, t_arrival_unix = time.monotonic_ns(), time.time_ns()  # upload time is network time
+            body = _parse(raw, model_cls)
+            custom_id = _client_id(request, body)
+            request.state.custom_id = custom_id
+            job = await admit(body, endpoint, custom_id, t_arrival, t_arrival_unix, client)
+        except APIError as e:
+            refused_id = custom_id or getattr(request.state, "custom_id", None)
+            # a running request's record must stay, whatever this refusal was
+            in_progress = e.code == "duplicate_request_id" or bool(
+                refused_id and service.scheduler is not None and service.scheduler.is_inflight(refused_id))
+            named = header is not None or getattr(body, "request_id", None) is not None  # chosen by the client
+            service.record_rejection(
+                endpoint=endpoint, client=client, custom_id=refused_id, request=_request_echo(body, len(raw)),
+                metadata=getattr(body, "metadata", None), http_status=e.status, error=e.body()["error"],
+                t_arrival_unix_ns=t_arrival_unix, in_progress=in_progress, named=named)
+            raise
         headers = {"X-Request-Id": custom_id}
         if body.stream:
             return stream(job, body, endpoint, headers)
         return await complete(request, job, body, endpoint, headers)
 
-    async def admit(body, endpoint: str, custom_id: str, t_arrival: int, t_arrival_unix: int) -> Job:
+    async def admit(body, endpoint: str, custom_id: str, t_arrival: int, t_arrival_unix: int, client: str) -> Job:
         scheduler, model, engine = service.scheduler, service.model, service.engine
         if body.model and body.model != service.model_name:
             raise APIError(404, f"model {body.model!r} is not served here; this server serves "
@@ -197,11 +242,18 @@ def create_app(service: Service) -> FastAPI:
         if body.stop:
             item["stop"] = body.stop
 
+        if service.output is not None and service.keys.required:
+            owner = await asyncio.to_thread(service.read_record, custom_id)
+            if owner is not None and owner.get("client", DEFAULT_CLIENT) != client:
+                reject("duplicate_request_id")
+                raise APIError(409, f"request id {custom_id!r} belongs to another client; use another id",
+                               code="duplicate_request_id", headers=_NO_RETRY)
         if scheduler.is_inflight(custom_id):
             reject("duplicate_request_id")
             raise APIError(409, f"a request with id {custom_id!r} is already in progress",
                            code="duplicate_request_id", headers=_NO_RETRY)
         try:
+            scheduler.check_client(client)
             scheduler.check_capacity()
         except AdmissionError as e:
             reject(_rejection_reason(e))
@@ -244,7 +296,7 @@ def create_app(service: Service) -> FastAPI:
         job = Job(custom_id=custom_id, attempt_id=service.new_attempt_id(), endpoint=endpoint, item=item,
                   sampling=sampling, stream=body.stream, prompt_tokens=prompt_tokens, t_arrival_ns=t_arrival,
                   t_arrival_unix_ns=t_arrival_unix, request_echo=request_echo, params_echo=params_echo,
-                  metadata=body.metadata)
+                  metadata=body.metadata, client=client)
         try:
             scheduler.submit(job)
         except AdmissionError as e:  # e.g. the same ID admitted meanwhile by a concurrent request
@@ -276,6 +328,15 @@ def create_app(service: Service) -> FastAPI:
                                                 error=error.body()["error"]))
         return error
 
+    def timed_out(job: Job, event: dict | None = None, result: dict | None = None) -> APIError:
+        """Record a request stopped by --request-timeout (with what it had generated)."""
+        error = APIError(504, f"the request did not finish within {service.settings.request_timeout} s of its "
+                              "arrival (the server's --request-timeout)", code="time_limit_exceeded",
+                         err_type="server_error", headers=_NO_RETRY)  # it would only run into the limit again
+        service.commit(job, service.make_record(job, status="failed", http_status=504, done=event, result=result,
+                                                error=error.body()["error"]))
+        return error
+
     def abandon(job: Job) -> None:
         """Nobody will read the job's final event (client gone, response failed, request cancelled): stop the
         job, then record it as cancelled and release its ID once the worker has let go of it."""
@@ -302,7 +363,7 @@ def create_app(service: Service) -> FastAPI:
                     service.commit(job, record)
                     return Response(status_code=499)
                 if finish == "cancelled":
-                    raise cancelled_by_server(job, event, result)
+                    raise timed_out(job, event, result) if job.timed_out else cancelled_by_server(job, event, result)
                 if finish == "error":
                     error = APIError(500, "generation failed in the engine", code="engine_error", err_type="server_error")
                     record = service.make_record(job, status="failed", http_status=500, done=event, result=result,
@@ -366,7 +427,9 @@ def create_app(service: Service) -> FastAPI:
                     event, result = payload
                     finish = result.get("finish_reason")
                     if finish == "cancelled":  # the client is still reading, so the server stopped it
-                        yield _sse(cancelled_by_server(job, event, result).body())
+                        stopped = timed_out(job, event, result) if job.timed_out else cancelled_by_server(job, event,
+                                                                                                            result)
+                        yield _sse(stopped.body())
                         yield "data: [DONE]\n\n"
                         return
                     if finish == "error":
@@ -564,7 +627,39 @@ def _echo_id(request: Request) -> dict[str, str]:
 
 
 def _rejection_reason(e: AdmissionError) -> str:
-    return {"server_is_overloaded": "queue_full", "server_shutting_down": "shutting_down"}.get(e.code, e.code)
+    return {"server_is_overloaded": "queue_full", "server_shutting_down": "shutting_down",
+            "too_many_requests": "client_limit", "rate_limit_exceeded": "rate_limited"}.get(e.code, e.code)
+
+
+_FORWARDED = ("forwarded", "x-forwarded-for", "x-real-ip")
+_MAX_SAVED_TEXT = 64 * 1024  # a refused request's own text is saved up to this body size
+
+
+def _loopback(request: Request) -> bool:
+    """Whether the request comes from this machine itself (also through an SSH tunnel to 127.0.0.1): a loopback
+    peer, a loopback Host (not a DNS-rebinding page) and no proxy in between (a proxy on this machine relays
+    other machines' requests)."""
+    if request.client is None or any(name in request.headers for name in _FORWARDED):
+        return False
+    return is_loopback(request.client.host) and is_loopback((request.url.hostname or "").strip("[]"))
+
+
+def _may_read(service: Service, client: str, record: dict) -> bool:
+    """With keys, a client reads the records of its own requests; the default key (the operator's) reads all."""
+    return not service.keys.required or client == DEFAULT_CLIENT or record.get("client", DEFAULT_CLIENT) == client
+
+
+def _request_echo(body, size: int) -> dict | None:
+    """What a refused request asked for, for its record (None when its body was invalid or not read); the text of
+    a large one is left out."""
+    if body is None:
+        return None
+    big = size > _MAX_SAVED_TEXT
+    echo = body.model_dump(mode="json", exclude_none=True,
+                           exclude={"request_id", "metadata"} | ({"messages", "prompt"} if big else set()))
+    if big:
+        echo["omitted"] = f"the text of a {size}-byte request"
+    return echo
 
 
 async def _wait_final(request: Request, job: Job, scheduler) -> tuple[tuple, bool]:

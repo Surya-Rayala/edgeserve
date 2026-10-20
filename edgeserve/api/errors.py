@@ -64,6 +64,7 @@ _WORKER_STATUS = {
     "input_too_long": (400, "context_length_exceeded", "invalid_request_error"),
     "bad_request": (400, "invalid_value", "invalid_request_error"),
     "queue_timeout": (503, "queue_timeout", "server_error"),
+    "time_limit_exceeded": (504, "time_limit_exceeded", "server_error"),
     "worker_exited": (503, "worker_restarted", "server_error"),
     "worker_unavailable": (503, "server_unavailable", "server_error"),
     "cuda_error": (503, "worker_restarted", "server_error"),

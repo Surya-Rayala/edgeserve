@@ -15,9 +15,10 @@ from pathlib import Path
 
 from edgeserve import config
 
-# Operating limits. Deliberately not flags: these defaults suit a single-GPU edge server.
+# Defaults of the queue and limit options (serve --queue-size etc.).
 QUEUE_SIZE = 16  # requests waiting for the GPU beyond the running batch
-QUEUE_TIMEOUT_S = 600.0  # a queued request that has not started by then fails with 503
+QUEUE_TIMEOUT_S = 600  # a queued request that has not started by then fails with 503
+# Fixed operating limits: these defaults suit a single-GPU edge server.
 MEMORY_FLOOR_BYTES = 256 * 1024**2  # refuse new requests while system memory is below this
 LOAD_HEADROOM_BYTES = 512 * 1024**2  # keep this much memory free after loading an engine
 DRAIN_TIMEOUT_S = 60.0  # how long shutdown waits for in-flight requests
@@ -47,6 +48,12 @@ class Settings:
     tls_cert: Path | None = None
     tls_key: Path | None = None
     native_dir: Path = field(default_factory=config.native_current)
+    queue_size: int = QUEUE_SIZE  # -1: no limit
+    queue_timeout: int = QUEUE_TIMEOUT_S  # seconds; 0: no limit
+    request_timeout: int = 0  # seconds from arrival to the last token; 0: no limit
+    max_client_requests: int = 0  # requests one client may have waiting or running; 0: no limit
+    client_rate_limit: int = 0  # requests per minute per client; 0: no limit
+    client_keys: bool = False  # the keys file (edgeserve keys) holds keys
 
     @property
     def tls(self) -> bool:
@@ -62,12 +69,22 @@ class Settings:
             raise ValueError("--max-batch-size above 16 is not supported by Edge-LLM")
         if not 0 < self.port < 65536:
             raise ValueError(f"--port must be between 1 and 65535, not {self.port}")
+        if self.queue_size < 1 and self.queue_size != -1:
+            raise ValueError(f"--queue-size must be at least 1, or -1 for no limit, not {self.queue_size}")
+        if self.queue_timeout < 0:
+            raise ValueError(f"--queue-timeout must be 0 (no limit) or more, not {self.queue_timeout}")
+        for flag, value in (("--request-timeout", self.request_timeout),
+                            ("--max-client-requests", self.max_client_requests),
+                            ("--client-rate-limit", self.client_rate_limit)):
+            if value < 0:
+                raise ValueError(f"{flag} must be 0 (no limit) or more, not {value}")
         if (self.tls_cert is None) != (self.tls_key is None):
             raise ValueError("set both EDGESERVE_TLS_CERT and EDGESERVE_TLS_KEY, or neither")
-        if not is_loopback(self.host) and not self.api_key:
+        if not is_loopback(self.host) and not self.api_key and not self.client_keys:
             raise ValueError(
                 f"refusing to listen on {self.host or 'every interface'} without an API key: set EDGESERVE_API_KEY "
-                "(edgeserve setup --network creates one) or use --host 127.0.0.1"
+                "(edgeserve setup --network creates one), add client keys (edgeserve keys add <name>) or use "
+                "--host 127.0.0.1"
             )
 
 
@@ -95,6 +112,11 @@ _SERVER_FLAGS = {
     "output_dir": ("EDGESERVE_OUTPUT_DIR", Path, None),
     "host": ("EDGESERVE_HOST", str, "127.0.0.1"),
     "port": ("EDGESERVE_PORT", int, 8000),
+    "queue_size": ("EDGESERVE_QUEUE_SIZE", int, QUEUE_SIZE),
+    "queue_timeout": ("EDGESERVE_QUEUE_TIMEOUT", int, QUEUE_TIMEOUT_S),
+    "request_timeout": ("EDGESERVE_REQUEST_TIMEOUT", int, 0),
+    "max_client_requests": ("EDGESERVE_MAX_CLIENT_REQUESTS", int, 0),
+    "client_rate_limit": ("EDGESERVE_CLIENT_RATE_LIMIT", int, 0),
 }
 
 
@@ -119,9 +141,26 @@ def add_server_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-dir", type=Path, metavar="DIR",
                         help="save a structured record of every request here (default: none) [EDGESERVE_OUTPUT_DIR]")
     parser.add_argument("--host", metavar="ADDRESS",
-                        help="address to listen on; 0.0.0.0 for other machines (needs EDGESERVE_API_KEY) "
-                             "(default 127.0.0.1) [EDGESERVE_HOST]")
+                        help="address to listen on; 0.0.0.0 for other machines (needs an API key: "
+                             "EDGESERVE_API_KEY, or edgeserve keys add) (default 127.0.0.1) [EDGESERVE_HOST]")
     parser.add_argument("--port", type=int, metavar="N", help="port (default 8000) [EDGESERVE_PORT]")
+    limits = parser.add_argument_group("queue and limits (a client is one API key, or one address without keys)")
+    limits.add_argument("--queue-size", type=int, metavar="N",
+                        help=f"requests that may wait beyond the running batch; more are refused with 503 "
+                             f"(default {QUEUE_SIZE}; -1: no limit, also no wait or connection limit unless "
+                             "--queue-timeout is set) [EDGESERVE_QUEUE_SIZE]")
+    limits.add_argument("--queue-timeout", type=int, metavar="SECONDS",
+                        help=f"a request still waiting after this fails with 503 (default {QUEUE_TIMEOUT_S}; 0: no "
+                             "limit) [EDGESERVE_QUEUE_TIMEOUT]")
+    limits.add_argument("--request-timeout", type=int, metavar="SECONDS",
+                        help="a request not finished this long after it arrived is stopped and fails with 504, "
+                             "a stream with an error event (default 0: no limit) [EDGESERVE_REQUEST_TIMEOUT]")
+    limits.add_argument("--max-client-requests", type=int, metavar="N",
+                        help="requests one client may have waiting or running at once; more are refused with 429 "
+                             "(default 0: no limit) [EDGESERVE_MAX_CLIENT_REQUESTS]")
+    limits.add_argument("--client-rate-limit", type=int, metavar="N",
+                        help="requests a minute one client may send: that many at once, then one every 60/N s; "
+                             "more are refused with 429 (default 0: no limit) [EDGESERVE_CLIENT_RATE_LIMIT]")
 
 
 def resolve(args: argparse.Namespace) -> dict[str, tuple[object, str]]:
@@ -152,13 +191,22 @@ def resolve(args: argparse.Namespace) -> dict[str, tuple[object, str]]:
 
 
 def from_args(args: argparse.Namespace) -> Settings:
-    values = {attr: v for attr, (v, _) in resolve(args).items()}
+    resolved = resolve(args)
+    values = {attr: v for attr, (v, _) in resolved.items()}
     if values["model"] is None:
         raise ValueError("no model given: pass --model <folder> or set EDGESERVE_MODEL (edgeserve setup --model)")
     tls_cert, tls_key = config.value("EDGESERVE_TLS_CERT"), config.value("EDGESERVE_TLS_KEY")
     output_dir = values.get("output_dir")
     native = config.value("EDGESERVE_NATIVE_DIR")
+    from edgeserve import keys
+
+    server = {attr: values[attr] for attr in ("queue_size", "queue_timeout", "request_timeout", "max_client_requests",
+                                              "client_rate_limit") if attr in values}
+    if server.get("queue_size") == -1 and resolved["queue_timeout"][1] == "default":
+        server["queue_timeout"] = 0  # -1 keeps every request until its turn, unless a wait limit is set
     settings = Settings(
+        **server,
+        client_keys=bool(keys.load()) if hasattr(args, "host") else False,  # serve only: build and info need none
         model=Path(values["model"]).expanduser().resolve(),
         max_input_len=values["max_input_len"],
         max_new_tokens=values["max_new_tokens"],

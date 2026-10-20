@@ -62,7 +62,7 @@ _MAX_LISTED_DUPLICATES = 20
 _STATUS_TEXT = {499: "cancelled by the server"}  # for error responses without a body (current servers send 503)
 # Anything a broken or unexpected /v1/models answer can raise (deeply nested JSON raises RecursionError).
 _PROBE_ERRORS = (httpx.HTTPError, httpx.InvalidURL, ValueError, LookupError, TypeError, AttributeError, RecursionError)
-_RECORD_HEADER = {"object": "edgeserve.record", "schema_version": "1.0"}
+_RECORD_HEADER = {"object": "edgeserve.record", "schema_version": "1.1"}
 _JSON_TYPES = {
     bool: "a boolean",
     int: "a number",
@@ -162,7 +162,7 @@ async def run_batch(
       {"X-Request-Id": custom_id, "Authorization": "Bearer <api_key>"} (no Authorization header when api_key is None);
       timeout: 10 s connect, 1800 s read.
     - 200: the body has a "record" key -> out.write_record(record); results line uses the body without "record".
-    - 400/401/404/409/413/422: not retried; writes a record {"object": "edgeserve.record", "schema_version": "1.0",
+    - 400/401/404/409/413/422: not retried; writes a record {"object": "edgeserve.record", "schema_version": "1.1",
       "custom_id", "status": "failed", "http_status", "error": body["error"] (or {"message": text})} and a results line.
     - 429/500/502/503/504 and connection errors: retried up to 6 attempts with exponential backoff (1, 2, 4, 8, 16 s,
       capped at 60 s), honouring Retry-After (seconds) when present; afterwards recorded as failed like above.
@@ -376,7 +376,7 @@ class _Runner:
                 return _Outcome(attempt, error=exc)
             else:
                 outcome = _Outcome(attempt, response=response)
-                if response.status_code not in _RETRY_STATUSES:
+                if response.status_code not in _RETRY_STATUSES or response.headers.get("x-should-retry") == "false":
                     return outcome
                 delay = _retry_delay_s(response, attempt)
             if attempt >= _MAX_ATTEMPTS or self.stop.is_set():
@@ -518,6 +518,7 @@ async def _probe_concurrency(client: httpx.AsyncClient, server: str, progress: C
         response.raise_for_status()
         models = response.json()["data"]
         size = models[0].get("max_batch_size") if models else None
+        limit = models[0].get("max_client_requests") if models else None
     except BatchServerError:
         raise
     except httpx.TransportError as exc:
@@ -535,9 +536,11 @@ async def _probe_concurrency(client: httpx.AsyncClient, server: str, progress: C
         reason = _one_line(_exception_text(exc))
         _say(progress, f"cannot read max_batch_size from {server}/v1/models ({reason}){fallback}")
         return _DEFAULT_CONCURRENCY
-    if isinstance(size, int) and not isinstance(size, bool) and size >= 1:
-        return size + 1
-    return _DEFAULT_CONCURRENCY
+    concurrency = size + 1 if isinstance(size, int) and not isinstance(size, bool) and size >= 1 \
+        else _DEFAULT_CONCURRENCY
+    if requested is None and isinstance(limit, int) and not isinstance(limit, bool) and limit >= 1:
+        concurrency = min(concurrency, limit)  # more would be refused: 429 too_many_requests
+    return concurrency
 
 
 def _certificate_problem(exc: BaseException, server: str) -> str | None:

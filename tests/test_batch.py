@@ -52,7 +52,7 @@ def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 def _server_record(custom_id: str) -> dict:
     return {
         "object": "edgeserve.record",
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "custom_id": custom_id,
         "attempt_id": f"att-{custom_id}",
         "status": "completed",
@@ -170,7 +170,7 @@ def _run_json(root: Path) -> dict:
 def _failed(custom_id: str, http_status: int | None, error: dict, attempts: int) -> dict:
     return {
         "object": "edgeserve.record",
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "custom_id": custom_id,
         "status": "failed",
         "http_status": http_status,
@@ -375,7 +375,7 @@ async def test_success_saves_records_results_and_run(tmp_path: Path) -> None:
     assert run["started_at"] <= run["finished_at"]
     assert (run["input_items"], run["skipped_completed"], run["invalid_lines"]) == (2, 0, [])
     assert run["concurrency"] == 2 and run["interrupted"] is False
-    assert run["request_counts"] == {"total": 2, "completed": 2, "failed": 0, "cancelled": 0}
+    assert run["request_counts"] == {"total": 2, "completed": 2, "failed": 0, "cancelled": 0, "rejected": 0}
     assert run["usage"] == {"prompt_tokens": 20, "completion_tokens": 40, "total_tokens": 60}
     assert run["e2e_ms"]["p50"] == 8400.0
     assert _mode(out.root / "results.jsonl") == 0o600 and _mode(out.root / "run.json") == 0o600
@@ -567,7 +567,7 @@ async def test_200_without_record_is_saved_as_completed(tmp_path: Path) -> None:
     _, lines = await _run([_item("seg-1")], out, server, concurrency=1)
     assert out.read_record("seg-1") == {
         "object": "edgeserve.record",
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "custom_id": "seg-1",
         "status": "completed",
         "http_status": 200,
@@ -650,7 +650,7 @@ async def test_retries_back_off_exponentially_then_fail(tmp_path: Path, sleeps: 
     assert line["response"] == {"status_code": 500, "request_id": None, "body": {"error": error}}
     assert line["error"] is None
     assert lines[-1] == "[1/1] seg-1 failed: HTTP 500 worker_error: worker crashed after 6 attempts"
-    assert summary["request_counts"] == {"total": 1, "completed": 0, "failed": 1, "cancelled": 0}
+    assert summary["request_counts"] == {"total": 1, "completed": 0, "failed": 1, "cancelled": 0, "rejected": 0}
 
 
 def _http_date(seconds_from_now: float) -> str:
@@ -899,7 +899,7 @@ async def test_resume_skips_completed_ids(tmp_path: Path) -> None:
     summary, lines = await _run([_item("seg-1"), _item("seg-2"), _item("seg-3")], out, server, concurrency=1)
     assert [request.headers["x-request-id"] for request in server.posts] == ["seg-2", "seg-3"]
     assert (summary["input_items"], summary["skipped_completed"]) == (3, 1)
-    assert summary["request_counts"] == {"total": 3, "completed": 3, "failed": 0, "cancelled": 0}
+    assert summary["request_counts"] == {"total": 3, "completed": 3, "failed": 0, "cancelled": 0, "rejected": 0}
     assert lines[0] == f"sending 2 requests to {SERVER} (concurrency 1, 1 already completed)"
     assert lines[1].startswith("[1/2] seg-2 ok") and lines[2].startswith("[2/2] seg-3 ok")
 
@@ -936,7 +936,7 @@ async def test_invalid_lines_are_recorded_as_failed(tmp_path: Path) -> None:
     assert failures == [("bad-1", None, {"code": "invalid_batch_line", "message": message})]
     assert summary["invalid_lines"] == invalid
     assert summary["input_items"] == 1
-    assert summary["request_counts"] == {"total": 3, "completed": 2, "failed": 1, "cancelled": 0}
+    assert summary["request_counts"] == {"total": 3, "completed": 2, "failed": 1, "cancelled": 0, "rejected": 0}
     assert [request.headers["x-request-id"] for request in server.posts] == ["seg-1"]
     assert not any("bad-1" in line for line in lines)  # main() reports invalid lines, not progress()
 
@@ -972,7 +972,7 @@ async def test_cancellation_lets_in_flight_requests_finish(tmp_path: Path) -> No
     assert out.completed_ids() == {"seg-0", "seg-1"}
     run = _run_json(tmp_path)
     assert run["interrupted"] is True and run["input_items"] == 5
-    assert run["request_counts"] == {"total": 2, "completed": 2, "failed": 0, "cancelled": 0}
+    assert run["request_counts"] == {"total": 2, "completed": 2, "failed": 0, "cancelled": 0, "rejected": 0}
     assert "interrupted: letting 2 in-flight request(s) finish (interrupt again to abort them)" in lines
 
 
@@ -1148,7 +1148,7 @@ def test_main_reports_and_records_invalid_lines(
     assert [request.headers["x-request-id"] for request in server.posts] == ["seg-1"]
     run = _run_json(out_dir)
     assert [entry["line_no"] for entry in run["invalid_lines"]] == [2, 3]
-    assert run["request_counts"] == {"total": 2, "completed": 1, "failed": 1, "cancelled": 0}
+    assert run["request_counts"] == {"total": 2, "completed": 1, "failed": 1, "cancelled": 0, "rejected": 0}
 
 
 def test_main_duplicate_ids_send_nothing(

@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from edgeserve.scheduler import Job
     from edgeserve.telemetry import Telemetry
 
-RECORD_SCHEMA = "1.0"
+RECORD_SCHEMA = "1.1"  # 1.1: "client", and the status "rejected" (a request refused before it was queued)
 
 
 @dataclass
@@ -141,6 +141,7 @@ def build_record(
         "created": job.t_arrival_unix_ns // 1_000_000_000,
         "endpoint": job.endpoint,
         "metadata": job.metadata,
+        "client": job.client,
         "system_fingerprint": ctx.system_fingerprint,
         "model": {
             "name": ctx.served_name,
@@ -392,7 +393,7 @@ _ITL_BUCKETS = (0.01, 0.025, 0.03, 0.035, 0.04, 0.045, 0.05, 0.06, 0.075, 0.1, 0
 _TOKEN_BUCKETS = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000)
 STATES = ("starting", "building_engine", "loading", "ready", "restarting", "draining", "failed", "stopped")
 REJECTION_REASONS = ("not_ready", "low_memory", "duplicate_request_id", "queue_full", "shutting_down",
-                     "context_length")
+                     "context_length", "client_limit", "rate_limited")
 
 
 class PrometheusMetrics:

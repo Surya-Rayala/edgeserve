@@ -3,7 +3,8 @@
 edgeserve implements the OpenAI chat completions, completions and models API. The official OpenAI
 SDKs, curl and tools such as NVIDIA AIPerf work unchanged. Interactive documentation is served at
 `/docs` (its *Authorize* button takes the API key; the page loads its scripts from a CDN, so the
-browser needs internet access).
+browser needs internet access). On a server with keys, open `/docs` on the server itself, or through
+an SSH tunnel: `ssh -L 8000:127.0.0.1:8000 <user>@<server-ip>`, then `https://127.0.0.1:8000/docs`.
 
 ## Endpoints
 
@@ -12,13 +13,17 @@ browser needs internet access).
 | POST | `/v1/chat/completions` | `messages` → the model's chat template → generation (streaming or not) | yes |
 | POST | `/v1/completions` | a prompt that already has the chat template applied | yes |
 | GET | `/v1/models`, `/v1/models/{model}` | the served model, its limits and quantization | yes |
-| GET | `/v1/records/{id}` | the stored record of a request ID (needs `--output-dir`) | yes |
+| GET | `/v1/records/{id}` | the stored record of a request ID (needs `--output-dir`); with client keys, a client gets only its own records, the `default` key all | yes |
 | GET | `/health` | liveness: 200 while running, 503 once the server has failed (startup failed, or the worker kept crashing) | no |
 | GET | `/health/ready` | readiness: 200 when requests are accepted, else 503 with the current step | no |
-| GET | `/metrics` | Prometheus metrics | no |
+| GET | `/metrics` | Prometheus metrics | from other machines |
+| GET | `/docs`, `/openapi.json` | the interactive API page and its schema | from other machines |
 
-"API key: yes" applies only when the server has one (`EDGESERVE_API_KEY`). It is sent as
-`Authorization: Bearer <key>`. The GET endpoints also answer HEAD.
+"API key: yes" applies when the server has a key: `EDGESERVE_API_KEY` (client `default`), or keys
+made with `edgeserve keys add <name>`, one per client. A server listening on the network always asks
+for one. It is sent as `Authorization: Bearer <key>`; the client it belongs to is saved in each
+record, and the per-client limits count each key on its own. "From other machines": with keys, these
+need a key too, except for requests from the server itself. The GET endpoints also answer HEAD.
 
 `GET /v1/models` returns the served model with its limits (they appear once the engine is built;
 until then the entry has only the name and `ready: false`):
@@ -29,6 +34,9 @@ until then the entry has only the name and `ready: false`):
   "max_batch_size": 1, "quantization": "INT4 groupwise W4A16 (group 128), fp16 lm_head",
   "engine_fingerprint": "ebfa954e92999d79"}]}
 ```
+
+With `--max-client-requests`, the entry also has `max_client_requests`, which `edgeserve batch` keeps its
+concurrency within.
 
 ## Requests
 
@@ -109,9 +117,10 @@ Responses are the standard OpenAI objects, with two extra fields:
   so the first chunk can come a token or two after `ttft_ms`.
 - With `include_usage`, a final chunk carries `usage` and `metrics`. Then comes `data: [DONE]`.
 - The streamed text always adds up to the final text, in whole UTF-8 characters.
-- An error after the stream has started (the engine failed, the worker crashed, 10 minutes in the
-  queue, shutdown) arrives as a `data: {"error": {…}}` event, then `data: [DONE]`. The HTTP status
-  is already 200 and there is no `Retry-After`. The OpenAI SDK raises it as an `APIError`.
+- An error after the stream has started (the engine failed, the worker crashed, longer than
+  `--queue-timeout` in the queue, past `--request-timeout`, shutdown) arrives as a
+  `data: {"error": {…}}` event, then `data: [DONE]`. The HTTP status is already 200 and there is no
+  `Retry-After`. The OpenAI SDK raises it as an `APIError`.
 
 A client that disconnects cancels its generation at the next token. The request is recorded as
 `cancelled` (HTTP 499, code `client_disconnected`).
@@ -128,10 +137,17 @@ Errors use OpenAI's format, `{"error": {"message", "type", "param", "code"}}`:
 | 404 | `model_not_found`, `not_found` | another model's name; an unknown record or endpoint |
 | 405 | `method_not_allowed` | e.g. GET on a POST endpoint |
 | 408 | `request_timeout` | the body did not arrive within 60 s |
-| 409 | `duplicate_request_id` | the same ID is still being processed (with `x-should-retry: false`, so the OpenAI SDK does not resend it) |
+| 409 | `duplicate_request_id` | the same ID is still being processed, or (with client keys) it belongs to another client (with `x-should-retry: false`, so the OpenAI SDK does not resend it) |
 | 413 | `body_too_large` | a body over 4 MiB |
-| 503 | `server_unavailable`, `server_is_overloaded`, `low_memory`, `worker_restarted`, `queue_timeout`, `server_shutting_down` | not ready yet; queue full (16 waiting); memory low; the GPU worker crashed and is restarting; waited 10 minutes in the queue; shutting down. All with `Retry-After`; safe to retry |
+| 429 | `too_many_requests`, `rate_limit_exceeded` | the client already has `--max-client-requests` requests waiting or running; it has used up its `--client-rate-limit` (N requests at once, then one more every 60/N s). With `Retry-After` |
+| 503 | `server_unavailable`, `server_is_overloaded`, `low_memory`, `worker_restarted`, `queue_timeout`, `server_shutting_down` | not ready yet; the queue is full (`--queue-size`, 16 by default); memory low; the GPU worker crashed and is restarting; waited longer than `--queue-timeout` (600 s by default); shutting down. All with `Retry-After`; safe to retry |
+| 504 | `time_limit_exceeded` | the request did not finish within `--request-timeout` of its arrival. Stopped while running: with `x-should-retry: false` (it would run out of time again), and its record keeps what it had generated (when it ran alone); dropped from the queue: may be retried |
 | 500 | `engine_error` | generation failed in the engine |
+
+`Retry-After` (on every 429 and 503) is in seconds: for `rate_limit_exceeded`, the time until the client
+may send again; for `server_unavailable` 10 and for `low_memory` 5; otherwise the running batch's
+expected remaining time, from the measured batch and step times, plus for `too_many_requests` the
+batches ahead of the client's own oldest request (1 to 60 s; 5 before the first batch has run).
 
 One client address can hold at most 32 connections; more are dropped at once, without a response.
 While all 128 connections are taken, every request (`/health` included) gets a plain-text 503.
@@ -173,7 +189,7 @@ saved as `records/doc-000123.json`. It can be fetched from any machine with
 | format | 1–512 printable ASCII characters, no leading or trailing space. With up to 200 letters, digits, `.`, `_` and `-` (not a leading `.`), the file name is the ID itself; other IDs are percent-encoded and, if long, shortened with a hash. `GET /v1/records/<id>` finds it either way |
 | no ID given | the server creates `req_<hex>` and returns it |
 | the header and the body disagree, or there are two `X-Request-Id` headers | 400 |
-| the same ID while it is still running | 409 |
+| the same ID while it is still running, or an ID another client used (with client keys) | 409 |
 | the same ID later | runs again: `records/<id>.json` holds the latest attempt; `results.jsonl` keeps every attempt, each line with its own `id` (the record's `attempt_id`) |
 
 ## Records
@@ -186,8 +202,11 @@ DIR/records/<id>.json   one file per ID: the request, the output text and token 
 DIR/results.jsonl       one line per attempt (OpenAI Batch output format)
 ```
 
-A request refused before it is queued (for example a 400, a 409 or a full queue) gets no record
-and no `results.jsonl` line.
+A request refused before it is queued (for example a 400, a 429 or a full queue) is saved too: as a
+`results.jsonl` line, and when it named its ID (the `X-Request-Id` header, or `request_id` in a body
+that passed validation) and that ID has no record yet and is not running, as a record with status
+`rejected`, the HTTP status and the error. At most 60 refusals a minute per client are saved;
+requests without a valid key are never saved.
 
 A record, abridged:
 

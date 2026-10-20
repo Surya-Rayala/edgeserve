@@ -251,7 +251,7 @@ def test_record_envelope_and_unix_timestamps(model) -> None:
         "first_token": T_STEPS[0] + shift, "last_token": T_STEPS[-1] + shift, "finished": T_FINISHED + shift,
     }
     assert record["created"] == 1_700_000_000
-    assert (record["object"], record["schema_version"]) == ("edgeserve.record", "1.0")
+    assert (record["object"], record["schema_version"]) == ("edgeserve.record", "1.1")
     assert (record["custom_id"], record["attempt_id"], record["status"], record["http_status"]) == (
         "seg-1", "att_1", "completed", 200)
     assert record["error"] is None and record["metadata"] == {"task": "demo"}
@@ -573,7 +573,8 @@ def test_exposition_uses_the_documented_names_types_and_labels(model) -> None:
     assert {s.labels["finished_reason"] for s in families["edgeserve_request_success"].samples} == {"stop", "length"}
     assert {s.labels["error_type"] for s in families["edgeserve_request_errors"].samples} == {"failed", "cancelled"}
     assert {s.labels["reason"] for s in families["edgeserve_admission_rejections"].samples} == {
-        "not_ready", "low_memory", "duplicate_request_id", "queue_full", "shutting_down", "context_length"}
+        "not_ready", "low_memory", "duplicate_request_id", "queue_full", "shutting_down", "context_length",
+        "client_limit", "rate_limited"}
     assert value(pm, "edgeserve_admission_rejections_total", reason="queue_full") == 1
     assert value(pm, "edgeserve_admission_rejections_total", reason="low_memory") == 0
     assert value(pm, "edgeserve_request_errors_total", error_type="cancelled") == 0

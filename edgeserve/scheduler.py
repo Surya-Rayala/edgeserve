@@ -1,10 +1,13 @@
 """Request queue in front of the single GPU worker.
 
 Requests are admitted only after every check that can fail (context length, queue space,
-memory) has passed, so overload is reported as an HTTP status rather than mid-stream. The
-dispatcher runs one generate command at a time on the worker; with --max-batch-size > 1 it
-takes the oldest queued request plus later ones that can share its batch (Edge-LLM batches
-need identical sampling settings and output limits), so a batch never waits for latecomers.
+memory, the client's own limit) has passed, so overload is reported as an HTTP status rather
+than mid-stream. The dispatcher runs one generate command at a time on the worker; with
+--max-batch-size > 1 it takes the oldest queued request plus later ones that can share its batch
+(Edge-LLM batches need identical sampling settings and output limits), so a batch never waits for
+latecomers. A request still waiting after --queue-timeout fails; with --request-timeout, a request
+not finished that long after it arrived is stopped (queued: dropped; running: cancelled at the next
+token). RateLimiter is the per-client requests-per-minute limit.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import time
 from collections import deque
 from collections.abc import Callable
@@ -51,6 +55,9 @@ class Job:
     request_echo: dict  # what the client sent (messages or prompt), stored in the record
     params_echo: dict  # effective generation parameters, stored in the record
     metadata: dict | None = None
+    client: str = "local"  # the API key's client name, or the client's address on a server without keys
+    deadline_ns: int | None = None  # --request-timeout: monotonic time by which the request must have finished
+    timed_out: bool = False  # stopped because of --request-timeout
     t_queued_ns: int = 0
     t_dispatch_ns: int | None = None
     batch_size: int = 1
@@ -60,6 +67,7 @@ class Job:
     cancel_requested: bool = False
     _generation: Generation | None = None
     _req_index: int = 0
+    _counted: bool = False  # counted in its client's requests (until released)
 
     def batch_key(self) -> tuple:
         kind = "prompt" if "prompt" in self.item else "messages"
@@ -76,23 +84,31 @@ class Scheduler:
         queue_size: int,
         queue_timeout_s: float,
         on_change: Callable[[], None] | None = None,
+        request_timeout_s: float = 0,
+        max_client_requests: int = 0,
     ) -> None:
         self._get_worker = get_worker
         self._max_batch = max_batch_size
         self._kv_capacity = kv_capacity
         self._queue_size = queue_size
         self._queue_timeout_ns = int(queue_timeout_s * 1e9)
+        self._request_timeout_ns = int(request_timeout_s * 1e9)
+        self._max_client = max_client_requests
         self._on_change = on_change or (lambda: None)
         self._queue: deque[Job] = deque()
         self._running: list[Job] = []
         self._inflight: set[str] = set()
+        self._per_client: dict[str, int] = {}  # client -> its requests waiting or running
         self._wake = asyncio.Event()
         self._idle = asyncio.Event()
         self._idle.set()
         self._accepting = True
         self._task: asyncio.Task | None = None
         self._expiry: asyncio.TimerHandle | None = None
-        self._e2e_ewma_s = 30.0  # refined from observed batches; only used for Retry-After hints
+        self._deadlines: asyncio.TimerHandle | None = None
+        self._batch_s: float | None = None  # moving average of a batch's run time (for Retry-After hints)
+        self._step_s: float | None = None  # moving average of one decode step (bounds a batch that runs long)
+        self._batch_started: float | None = None  # when the running batch started (monotonic s)
 
     # ------------------------------------------------------------------ admission
 
@@ -110,18 +126,40 @@ class Scheduler:
         used = sum(j.prompt_tokens + j.sampling["max_new_tokens"] for j in self._running)
         return min(1.0, used / (self._kv_capacity * self._max_batch))
 
-    def retry_after_s(self) -> int:
-        batches_ahead = (len(self._queue) + len(self._running)) / self._max_batch + 1
-        return int(min(120, max(1, batches_ahead * self._e2e_ewma_s)))
+    def retry_after_s(self, client: str | None = None) -> int:
+        """Seconds until a refused request can get in: when the running batch ends, the next one leaves the
+        queue. Its expected remaining time from the measured batch times, bounded by its token budget when it runs
+        longer than usual; for one client (``client``), also the batches ahead of its oldest waiting request.
+        1 to 60 s; 5 s before any batch ran."""
+        if self._batch_s is None:
+            return 5
+        remaining = 0.0
+        if self._batch_started is not None:
+            elapsed = time.monotonic() - self._batch_started
+            remaining = self._batch_s - elapsed
+            if remaining < 1 and self._step_s and self._running:  # longer than usual: at most its token budget
+                remaining = self._running[0].sampling["max_new_tokens"] * self._step_s - elapsed
+        if client is not None and not any(job.client == client for job in self._running):
+            ahead = next((i for i, job in enumerate(self._queue) if job.client == client), 0)
+            remaining += (ahead // self._max_batch + 1) * self._batch_s  # its oldest request has yet to run
+        return int(min(60, max(1, math.ceil(remaining))))
 
     def is_inflight(self, custom_id: str) -> bool:
         return custom_id in self._inflight
+
+    def check_client(self, client: str) -> None:
+        """--max-client-requests: refuse a client that already has that many requests waiting or running."""
+        if self._max_client and self._per_client.get(client, 0) >= self._max_client:
+            raise AdmissionError(429, "too_many_requests",
+                                 f"client {client!r} already has {self._max_client} requests waiting or running "
+                                 "(the server's --max-client-requests); retry when one has finished",
+                                 retry_after=self.retry_after_s(client), err_type="rate_limit_error")
 
     def check_capacity(self) -> None:
         if not self._accepting:
             raise AdmissionError(503, "server_shutting_down", "the server is shutting down",
                                  retry_after=self.retry_after_s(), err_type="server_error")
-        if len(self._queue) >= self._queue_size:
+        if 0 <= self._queue_size <= len(self._queue):  # -1: no limit
             raise AdmissionError(503, "server_is_overloaded",
                                  f"the request queue is full ({self._queue_size} waiting); retry later",
                                  retry_after=self.retry_after_s(), err_type="server_error")
@@ -132,13 +170,19 @@ class Scheduler:
         if job.custom_id in self._inflight:
             raise AdmissionError(409, "duplicate_request_id",
                                  f"a request with id {job.custom_id!r} is already in progress")
+        self.check_client(job.client)
         self._inflight.add(job.custom_id)
+        self._per_client[job.client] = self._per_client.get(job.client, 0) + 1
+        job._counted = True
         job.state = "queued"
         job.t_queued_ns = time.monotonic_ns()
+        if self._request_timeout_ns:
+            job.deadline_ns = job.t_arrival_ns + self._request_timeout_ns
         self._queue.append(job)
         self._idle.clear()
         self._wake.set()
         self._arm_expiry()
+        self._arm_deadlines()
         self._on_change()
 
     def release(self, job: Job) -> None:
@@ -146,6 +190,17 @@ class Scheduler:
         if job.state != "finished":
             self.cancel(job)
         self._inflight.discard(job.custom_id)
+        self._uncount(job)
+
+    def _uncount(self, job: Job) -> None:
+        """Give the job's place back to its client (once)."""
+        if job._counted:
+            job._counted = False
+            left = self._per_client.get(job.client, 1) - 1
+            if left > 0:
+                self._per_client[job.client] = left
+            else:
+                self._per_client.pop(job.client, None)
 
     def cancel(self, job: Job) -> None:
         """Client went away: drop a queued job, or ask the worker to stop a running one at its next step."""
@@ -158,6 +213,7 @@ class Scheduler:
             self._on_change()
         elif job.state == "running" and not job.cancel_requested:
             job.cancel_requested = True
+            self._uncount(job)  # it stops at its next token: its client need not wait for the rest of the batch
             if job._generation is not None:
                 asyncio.ensure_future(_quiet(job._generation.cancel(job._req_index)))
 
@@ -186,9 +242,10 @@ class Scheduler:
             self._task.cancel()  # a batch still running now ends as cancelled
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-        if self._expiry is not None:
-            self._expiry.cancel()
-            self._expiry = None
+        for timer in (self._expiry, self._deadlines):
+            if timer is not None:
+                timer.cancel()
+        self._expiry = self._deadlines = None
 
     def fail_queued(self, error: WorkerError) -> None:
         """Fail every queued job (the worker cannot be brought back)."""
@@ -205,6 +262,7 @@ class Scheduler:
             self._wake.clear()
             while self._queue:
                 self._expire_old()
+                self._drop_overdue()
                 worker = self._get_worker()
                 if not self._queue or worker is None or not worker.alive:
                     break  # the service wakes us when a worker is ready again
@@ -219,13 +277,14 @@ class Scheduler:
                     _finish(batch, ("error", WorkerError("internal_error", "internal server error")))
                 finally:
                     self._running = []
+                    self._batch_started = None
                     self._maybe_idle()
                     self._on_change()
             self._maybe_idle()
 
     def _arm_expiry(self) -> None:
         """Expire queued jobs on time even while no worker is available or a batch is running."""
-        if self._expiry is None and self._queue:
+        if self._expiry is None and self._queue and self._queue_timeout_ns:  # 0: no limit
             due_ns = self._queue[0].t_queued_ns + self._queue_timeout_ns - time.monotonic_ns()
             self._expiry = asyncio.get_running_loop().call_later(max(0.0, due_ns / 1e9), self._expiry_due)
 
@@ -234,10 +293,48 @@ class Scheduler:
         self._expire_old()
         self._arm_expiry()
 
+    def _arm_deadlines(self) -> None:
+        """--request-timeout: check the waiting and running requests every second while there are any."""
+        if self._deadlines is None and self._request_timeout_ns and (self._queue or self._running):
+            self._deadlines = asyncio.get_running_loop().call_later(1.0, self._deadlines_due)
+
+    def _deadlines_due(self) -> None:
+        self._deadlines = None
+        self._drop_overdue()
+        now = time.monotonic_ns()
+        for job in self._running:
+            if job.deadline_ns is not None and now >= job.deadline_ns and not job.timed_out:
+                job.timed_out = True
+                self.cancel(job)  # alone in its batch, its "done" event follows, with finish_reason "cancelled"
+                if len(self._running) > 1 and job.state != "finished":
+                    # Edge-LLM reports a batch once, when all its sequences have ended: answer this one now
+                    job.state = "finished"
+                    job.events.put_nowait(("error", WorkerError("time_limit_exceeded", self._time_limit_message())))
+        self._arm_deadlines()
+
+    def _drop_overdue(self) -> None:
+        """Fail the waiting requests whose --request-timeout has passed (also checked before each dispatch)."""
+        if not self._request_timeout_ns:
+            return
+        now = time.monotonic_ns()
+        overdue = [job for job in self._queue if job.deadline_ns is not None and now >= job.deadline_ns]
+        for job in overdue:
+            self._queue.remove(job)
+            job.state = "finished"
+            job.timed_out = True
+            job.events.put_nowait(("error", WorkerError("time_limit_exceeded", self._time_limit_message())))
+        if overdue:
+            self._maybe_idle()
+            self._on_change()
+
+    def _time_limit_message(self) -> str:
+        return (f"the request did not finish within {self._request_timeout_ns / 1e9:g} s of its arrival (the "
+                "server's --request-timeout)")
+
     def _expire_old(self) -> None:
         now = time.monotonic_ns()
         expired = False
-        while self._queue and now - self._queue[0].t_queued_ns > self._queue_timeout_ns:
+        while self._queue_timeout_ns and self._queue and now - self._queue[0].t_queued_ns > self._queue_timeout_ns:
             job = self._queue.popleft()
             job.state = "finished"
             job.events.put_nowait(("error", WorkerError("queue_timeout",
@@ -269,7 +366,7 @@ class Scheduler:
             job.batch_size = len(batch)
         self._running = batch
         self._on_change()
-        started = time.monotonic()
+        started = self._batch_started = time.monotonic()
         try:
             generation = await worker.generate([j.item for j in batch], batch[0].sampling,
                                                stream=any(j.stream for j in batch))
@@ -281,6 +378,7 @@ class Scheduler:
             if job.cancel_requested:  # disconnected while being dispatched
                 await _quiet(generation.cancel(job._req_index))
 
+        steps = 0  # decode steps of the batch, from its "done" event
         async for event in generation.events():
             kind = event["ev"]
             if kind == "text":
@@ -288,6 +386,7 @@ class Scheduler:
                 if 0 <= req < len(batch):
                     batch[req].events.put_nowait(("text", event))
             elif kind == "done":
+                steps = len((event.get("steps") or {}).get("t_ns", []))
                 contexts = _batch_contexts(event.get("results", []), batch)
                 for result in event.get("results", []):
                     req = result.get("req", 0)
@@ -302,11 +401,46 @@ class Scheduler:
         # a done event that omitted a sequence must not leave its client hanging
         _finish(batch, ("error", WorkerError("internal_error", "the worker returned no result")))
         elapsed = time.monotonic() - started
-        self._e2e_ewma_s = 0.8 * self._e2e_ewma_s + 0.2 * elapsed
+        self._batch_s = elapsed if self._batch_s is None else 0.7 * self._batch_s + 0.3 * elapsed
+        if steps:
+            per_step = elapsed / steps
+            self._step_s = per_step if self._step_s is None else 0.7 * self._step_s + 0.3 * per_step
 
     def _maybe_idle(self) -> None:
         if not self._queue and not self._running:
             self._idle.set()
+
+
+class RateLimiter:
+    """--client-rate-limit: at most N requests per minute per client, as a token bucket (a client may send N at
+    once, then one more every 60/N seconds)."""
+
+    def __init__(self, per_minute: int, clock: Callable[[], float] = time.monotonic) -> None:
+        self._rate = per_minute / 60.0
+        self._capacity = float(per_minute)
+        self._clock = clock
+        self._buckets: dict[str, tuple[float, float]] = {}  # client -> (tokens, at)
+        self._prune_at = 4096
+
+    def take(self, client: str) -> None:
+        """Count one request; raise AdmissionError(429) when the client is over its limit."""
+        if not self._rate:
+            return
+        now = self._clock()
+        tokens, at = self._buckets.get(client, (self._capacity, now))
+        tokens = min(self._capacity, tokens + (now - at) * self._rate)
+        if tokens < 1.0:
+            self._buckets[client] = (tokens, now)
+            wait = math.ceil((1.0 - tokens) / self._rate)
+            raise AdmissionError(429, "rate_limit_exceeded",
+                                 f"client {client!r} is over the server's --client-rate-limit ({self._capacity:g} "
+                                 f"requests a minute: that many at once, then one every {60 / self._capacity:g} s); "
+                                 f"retry in {wait} s", retry_after=wait, err_type="rate_limit_error")
+        self._buckets[client] = (tokens - 1.0, now)
+        if len(self._buckets) > self._prune_at:  # forget clients whose allowance is full again
+            self._buckets = {c: (t, a) for c, (t, a) in self._buckets.items()
+                             if t + (now - a) * self._rate < self._capacity}
+            self._prune_at = max(4096, 2 * len(self._buckets))  # so that pruning costs O(1) per request
 
 
 def _finish(jobs: list[Job], event: tuple) -> None:
@@ -335,4 +469,4 @@ async def _quiet(coroutine) -> None:
         await coroutine
 
 
-__all__ = ["AdmissionError", "Job", "Scheduler"]
+__all__ = ["AdmissionError", "Job", "RateLimiter", "Scheduler"]

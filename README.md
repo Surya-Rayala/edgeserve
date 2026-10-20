@@ -7,14 +7,18 @@ Run LLMs on NVIDIA Jetson and NVIDIA GPUs behind an OpenAI-compatible API, using
 - Serves Hugging Face models and your own fine-tuned, pruned or quantized checkpoints, in FP16/BF16,
   INT4 (AWQ, GPTQ), INT8, FP8 or NVFP4, whichever your GPU supports.
 - Converts the model to a TensorRT engine for your GPU on first start, and caches it.
-- Keeps your request IDs and records metrics per request and per token (latency, tokens/s, energy).
-- Guards small devices against running out of memory.
-- `edgeserve setup --network` adds an API key and HTTPS for other machines.
+- Keeps your request IDs and saves every request, with metrics per request and per token (latency,
+  tokens/s, energy).
+- Queues and batches simultaneous requests, with limits per client, and guards small devices against
+  running out of memory.
+- `edgeserve setup --network` adds HTTPS and an API key for other machines; `edgeserve keys add` gives each
+  client its own key.
 
 **Steps:** [1. Install](#1-install) · [2. Build the GPU runtime](#2-build-the-gpu-runtime) ·
 [3. Export a model](#3-export-a-model) · [4. Serve](#4-serve) ([free memory](#free-memory-on-a-jetson)) ·
 [5. Send requests](#5-send-requests) ·
 [6. Access from other machines](#6-access-from-other-machines). Also: [request format](#request-format),
+[many requests at once](#many-requests-at-once), [saved requests](#saved-requests),
 [your own models](#your-own-models), [batch jobs](#batch-jobs), [service](#run-as-a-service),
 [uninstall](#uninstall), [commands](#command-reference), [options and settings](#options-and-settings),
 [troubleshooting](#troubleshooting), [documentation](#documentation).
@@ -140,12 +144,24 @@ edgeserve serve --model <model-dir>
 
 The first start converts the model to a TensorRT engine for your GPU (a minute to a few minutes)
 and caches it; later starts take seconds. The server listens on `http://127.0.0.1:8000`, which
-only this machine can reach. Stop it with Ctrl-C.
+only this machine can reach. Stop it with Ctrl-C. To test it, run `edgeserve check` in a second
+terminal.
 
-To test it, run `edgeserve check` in a second terminal. To serve the model without typing its path
-each time, run `edgeserve setup --model <model-dir>` once; after that, `edgeserve serve` is enough.
+The options you will use most:
 
-## Free memory on a Jetson
+| Option | Default | What it does |
+|---|---|---|
+| `--model DIR` | none | the model folder; after `edgeserve setup --model <model-dir>`, plain `edgeserve serve` is enough |
+| `--output-dir DIR` | none | save every request, answered or not, as JSON ([saved requests](#saved-requests)) |
+| `--max-batch-size N` | 1 | requests generated together ([many requests at once](#many-requests-at-once)) |
+| `--max-input-len N` | 3072 | the longest prompt, in tokens |
+| `--max-new-tokens N` | the model's default, else 512 | the answer length when a request does not set `max_tokens` |
+| `--host ADDRESS`, `--port N` | 127.0.0.1, 8000 | where the server listens; [step 6](#6-access-from-other-machines) opens it to the network |
+
+The queue and per-client limits are in [many requests at once](#many-requests-at-once); every option,
+and how to set it permanently, in [options and settings](#options-and-settings).
+
+### Free memory on a Jetson
 
 On Jetson the GPU has no memory of its own: the model, its engine build and everything else
 running share the board's RAM. Before serving (and especially before the first start, which
@@ -334,6 +350,77 @@ key and the CA file.
   the `ufw` commands for your network.
 - **This machine only again:** set `EDGESERVE_HOST=127.0.0.1` in the settings file.
 
+### A key for each client
+
+Give each person or machine its own key, so that you can revoke one without changing the others:
+
+```bash
+edgeserve keys add <name>       # makes a key for client <name> and shows it once
+edgeserve keys list             # the clients that have keys (never the keys)
+edgeserve keys remove <name>    # that key stops working at once
+```
+
+Give each client the key that `edgeserve keys add` printed, instead of the one step 6 copies:
+`export EDGESERVE_API_KEY=es-…`. Keys work at once, also on a running server. Once one exists, every
+`/v1/` request needs a key, from the server itself too (`edgeserve check` and `edgeserve batch` send
+`EDGESERVE_API_KEY`). edgeserve keeps only a hash of each key, in `~/.config/edgeserve/client-keys.json`;
+the key of `edgeserve setup --network` keeps working as client `default`.
+
+- **Each client on its own:** saved requests show their client, a client key reads only its own
+  records (the `default` key reads all), a request ID belongs to the client that used it first, and the
+  per-client limits below count each key on its own.
+- **Pages for the operator:** `/metrics` and the API page `/docs` need a key as well, except from the
+  server itself (a reverse proxy on the server must send `X-Forwarded-For`); `/health` and
+  `/health/ready` stay open.
+
+## Many requests at once
+
+Requests wait in a queue and run in the order they arrived. With `--max-batch-size N`, up to N waiting
+requests with the same settings (`temperature`, `top_p`, `top_k` and `max_tokens`) run together. Each
+batch slot reserves its own memory when the server starts, so lower `--max-input-len` and
+`--max-new-tokens` to make room for more. Measured on an 8 GB Orin Nano with a pruned 6B INT4 model,
+20 requests sent at once:
+
+| Server | Answered | All done after | Total speed |
+|---|---|---|---|
+| `edgeserve serve` (batch size 1) | 17 of 20 | 51 s | 24 tokens/s |
+| `edgeserve serve --max-batch-size 3 --max-input-len 1024 --max-new-tokens 256` | 19 of 20 | 29 s | 47 tokens/s |
+
+The queue and the limits (a client is one API key, or one address on a server without keys):
+
+| Option | Default | What happens |
+|---|---|---|
+| `--queue-size N` | 16 | beyond N waiting requests, new ones are refused: 503 `server_is_overloaded`. `-1`: every request waits for its turn (no wait limit unless `--queue-timeout` is given, and no connection limit) |
+| `--queue-timeout SECONDS` | 600 | a request that has waited that long fails: 503 `queue_timeout`. `0`: no limit |
+| `--request-timeout SECONDS` | 0 (no limit) | a request not finished that long after it arrived is stopped: 504 `time_limit_exceeded` (a stream gets it as its last event) |
+| `--max-client-requests N` | 0 (no limit) | a client with N requests waiting or running is refused more: 429 `too_many_requests` |
+| `--client-rate-limit N` | 0 (no limit) | N requests a minute per client: N at once, then one every 60/N seconds; more are refused: 429 `rate_limit_exceeded` |
+
+Every 429 and 503 carries a `Retry-After` header, in seconds: when the client may send again (for the
+rate limit), otherwise the expected rest of the running batch, from the measured batch times (1 to
+60 s). The OpenAI SDK and `edgeserve batch` wait and retry these by themselves; with curl, retry
+yourself. A 504 is marked not to be sent again: it would run out of time again. Without
+`--queue-size -1`, one address can open at most 32 connections and all clients together 128. A
+waiting client still gives up when its own timeout runs out (the OpenAI SDK after 600 s:
+`OpenAI(..., timeout=3600)` waits longer), and its request then leaves the queue.
+
+## Saved requests
+
+With `edgeserve serve --output-dir <output-dir>`, every request is saved:
+
+| File | What it holds |
+|---|---|
+| `<output-dir>/records/<id>.json` | the latest attempt of each request ID: the request, the answer, its client, metrics per request and per token, and its status: `completed`, `failed`, `cancelled` or `rejected` (refused before it was queued; `http_status` and `error` say why) |
+| `<output-dir>/results.jsonl` | one line per attempt, in OpenAI's batch output format |
+
+A refused request gets a `results.jsonl` line, and a record when it named its ID (`X-Request-Id`, or
+`request_id` in a valid body) and that ID has no record yet: a refusal never replaces an earlier
+record. At most 60 refusals a minute per client are saved, and requests without a valid key never.
+`GET /v1/records/<id>` returns a record, also from another machine (with client keys, only the
+client's own). The folder is readable only by the user running the server, as records hold prompts
+and answers. Every field:
+[docs/METRICS.md](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/METRICS.md).
+
 ## Your own models
 
 Find what you have:
@@ -443,6 +530,7 @@ both to the clients again.
 | `edgeserve build` | only convert the model to an engine (or check the cached one), then exit |
 | `edgeserve info` | settings and where each comes from, the GPU runtime, the hardware; with `--model`, the model, its memory estimate and its cached engine |
 | `edgeserve check [--server URL] [--ca-cert FILE]` | test a running server end to end |
+| `edgeserve keys add NAME`, `edgeserve keys list`, `edgeserve keys remove NAME` | API keys, one per client |
 | `edgeserve batch INPUT --output-dir DIR [--server URL] [--ca-cert FILE] [--concurrency N]` | run a JSONL file of requests |
 | `edgeserve service install [--print]`, `edgeserve service remove` | run the server at boot (systemd) |
 | `edgeserve --version` | the edgeserve and TensorRT Edge-LLM versions |
@@ -454,19 +542,37 @@ Each option can also be set as a line `NAME=value` in `~/.config/edgeserve/edges
 option on the command line wins over the environment, which wins over the file. `edgeserve info`
 shows where each value came from.
 
-| Option (`serve`; `build` and `info` take the first five) | Setting | Default | Meaning |
+**The model and its engine** (`serve`, `build` and `info`):
+
+| Option | Setting | Default | Meaning |
 |---|---|---|---|
 | `--model DIR` | `EDGESERVE_MODEL` | none | the model folder (an absolute path in the file) |
 | `--max-input-len N` | `EDGESERVE_MAX_INPUT_LEN` | 3072 | longest prompt in tokens; longer prompts are refused, never cut |
 | `--max-new-tokens N` | `EDGESERVE_MAX_NEW_TOKENS` | the model's `generation_config.json`, else 512 | output length when a request sets no `max_tokens` |
 | `--max-batch-size N` | `EDGESERVE_MAX_BATCH_SIZE` | 1 | requests generated together; each one needs its own memory |
 | `--cache-dir DIR` | `EDGESERVE_CACHE_DIR` | `~/.cache/edgeserve` | where engines are kept |
-| `--output-dir DIR` | `EDGESERVE_OUTPUT_DIR` | none | save a record of every request here |
+
+**The server** (`serve`):
+
+| Option | Setting | Default | Meaning |
+|---|---|---|---|
+| `--output-dir DIR` | `EDGESERVE_OUTPUT_DIR` | none | save every request here ([saved requests](#saved-requests)) |
 | `--host ADDRESS` | `EDGESERVE_HOST` | 127.0.0.1 | `127.0.0.1`: this machine only; `0.0.0.0`: the network (needs an API key) |
 | `--port N` | `EDGESERVE_PORT` | 8000 | port |
-| none | `EDGESERVE_API_KEY` | none | the key clients must send as `Authorization: Bearer <key>` (no option, so it never shows in process lists) |
-| none | `EDGESERVE_TLS_CERT`, `EDGESERVE_TLS_KEY` | none | HTTPS certificate and private key (PEM files) |
-| none | `EDGESERVE_NATIVE_DIR` | none | use another GPU runtime build (development) |
+| `--queue-size N` | `EDGESERVE_QUEUE_SIZE` | 16 | requests that may wait beyond the running batch; `-1`: no limit, nor a wait or connection limit |
+| `--queue-timeout SECONDS` | `EDGESERVE_QUEUE_TIMEOUT` | 600 | how long a request may wait; `0`: no limit |
+| `--request-timeout SECONDS` | `EDGESERVE_REQUEST_TIMEOUT` | 0 | how long a request may take from arrival to its last token; `0`: no limit |
+| `--max-client-requests N` | `EDGESERVE_MAX_CLIENT_REQUESTS` | 0 | requests one client may have waiting or running; `0`: no limit |
+| `--client-rate-limit N` | `EDGESERVE_CLIENT_RATE_LIMIT` | 0 | requests per minute per client; `0`: no limit |
+
+**Keys, certificates and the runtime** (no command-line option, so a key never shows in process lists; set
+them in the settings file or the environment):
+
+| Setting | Meaning |
+|---|---|
+| `EDGESERVE_API_KEY` | the key of client `default`, sent as `Authorization: Bearer <key>`; more keys: [edgeserve keys](#a-key-for-each-client) |
+| `EDGESERVE_TLS_CERT`, `EDGESERVE_TLS_KEY` | HTTPS certificate and private key (PEM files) |
+| `EDGESERVE_NATIVE_DIR` | use another GPU runtime build (development) |
 
 Changing `--max-input-len`, `--max-new-tokens` or `--max-batch-size` builds a new engine (cached
 too). `check` and `batch` use this machine's server unless given `--server URL`, and trust a
@@ -487,7 +593,10 @@ settings folder), `EDGESERVE_API_KEY` on a client (the key `check` and `batch` s
 | "is a Hugging Face checkpoint, not an exported model" | export it first: `edgeserve export <checkpoint-dir> <model-dir>`, then serve `<model-dir>` |
 | "is a GGUF file", "holds GGUF files" or "holds an ONNX model made by another tool" | export the Hugging Face checkpoint the model was made from |
 | "has no config.json" | `--model` must be the folder `edgeserve export` made; for `export`, the checkpoint folder must hold `config.json` |
-| HTTP 401 | send the key: `Authorization: Bearer <key>` |
+| HTTP 401 | send the key: `Authorization: Bearer <key>`; a key removed with `edgeserve keys remove` no longer works |
+| HTTP 429 `too_many_requests` or `rate_limit_exceeded` | the client is over `--max-client-requests` or `--client-rate-limit`: retry after the `Retry-After` seconds |
+| HTTP 503 `server_is_overloaded` or `queue_timeout` | the queue is full or the wait too long: retry after `Retry-After`; raise `--queue-size` or `--queue-timeout`, or batch more with `--max-batch-size` |
+| HTTP 504 `time_limit_exceeded` | the request took longer than `--request-timeout` (it is not sent again automatically): raise the limit, or ask for fewer `max_tokens` |
 | certificate errors | give the client `edgeserve-ca.crt`; use a host name or address the certificate lists, or run `edgeserve setup --network` again after an address change |
 | `<host>.local` does not connect | use the IP address; mDNS can announce a Docker bridge address (fix: `deny-interfaces=docker0` in `/etc/avahi/avahi-daemon.conf`) |
 | other machines cannot connect | run `edgeserve setup --network` and restart; check the firewall (`sudo ufw status`) |

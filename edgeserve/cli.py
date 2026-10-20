@@ -1,4 +1,4 @@
-"""Command line: ``edgeserve setup | export | serve | build | info | batch | check | service``."""
+"""Command line: ``edgeserve setup | export | serve | build | info | batch | check | keys | service``."""
 
 from __future__ import annotations
 
@@ -113,6 +113,15 @@ def _parser() -> argparse.ArgumentParser:
     check.add_argument("--ca-cert", metavar="FILE",
                        help="CA certificate to trust for HTTPS (the server's edgeserve-ca.crt; default: this "
                             "machine's, for its own server)")
+    keys = sub.add_parser("keys", allow_abbrev=False,
+                          help="API keys, one per client: add NAME, list, remove NAME (they work at once, also on a "
+                               "running server)")
+    keys_actions = keys.add_subparsers(dest="action", required=True, metavar="ACTION")
+    add_key = keys_actions.add_parser("add", help="make a key for a new client and show it once", allow_abbrev=False)
+    add_key.add_argument("name", metavar="NAME", help="the client's name, e.g. lab-laptop (letters, digits, . _ -)")
+    keys_actions.add_parser("list", help="the clients that have keys (never the keys themselves)", allow_abbrev=False)
+    remove_key = keys_actions.add_parser("remove", help="revoke a client's key", allow_abbrev=False)
+    remove_key.add_argument("name", metavar="NAME", help="the client's name")
     service = sub.add_parser("service", help="start the server at boot (systemd); run as your user, it uses sudo "
                                              "for the system steps", allow_abbrev=False)
     service.add_argument("action", choices=["install", "remove"],
@@ -150,6 +159,10 @@ def main(argv: list[str] | None = None) -> int:
         from edgeserve import check
 
         return check.run(args.server, args.ca_cert)
+    if args.command == "keys":
+        from edgeserve import keys
+
+        return keys.run(args.action, getattr(args, "name", None))
     if args.command == "service":
         from edgeserve import systemd
 
@@ -203,8 +216,10 @@ def _serve(settings: cfg.Settings) -> int:
         log_config=None,
         timeout_graceful_shutdown=_RESPONSE_GRACE_S,
         timeout_keep_alive=30,
-        limit_concurrency=cfg.MAX_CONNECTIONS,
-        http=_head_timeout_protocol(),
+        # --queue-size -1 keeps every request until its turn, so no connection limit refuses them either
+        limit_concurrency=None if settings.queue_size == -1 else cfg.MAX_CONNECTIONS,
+        proxy_headers=False,  # the peer is the client: X-Forwarded-For cannot choose who a request counts as
+        http=_head_timeout_protocol(per_client_limit=settings.queue_size != -1),
     )
     try:
         config.load()  # reads the TLS certificate and key
@@ -224,7 +239,7 @@ def _serve(settings: cfg.Settings) -> int:
     return 1 if service.state == "failed" else 0
 
 
-def _head_timeout_protocol():
+def _head_timeout_protocol(per_client_limit: bool = True):
     """uvicorn's HTTP/1.1 protocol with the deadlines it lacks, so no client can hold a connection forever.
 
     * A connection must send a complete request head within HEAD_TIMEOUT_S, after connecting and after each
@@ -235,7 +250,7 @@ def _head_timeout_protocol():
       (Python 3.10), so a peer that never answers would keep its connection, and its place under
       limit_concurrency, forever.
     * One client address may hold at most MAX_CONNECTIONS_PER_CLIENT connections, so a single host cannot take
-      all MAX_CONNECTIONS (which uvicorn counts server-wide).
+      all MAX_CONNECTIONS (which uvicorn counts server-wide); not with ``per_client_limit`` False (--queue-size -1).
     """
     from uvicorn.protocols.http.h11_impl import H11Protocol
 
@@ -263,7 +278,7 @@ def _head_timeout_protocol():
         def connection_made(self, transport) -> None:
             peer = transport.get_extra_info("peername")
             client = peer[0] if isinstance(peer, tuple) and peer else "?"
-            if per_client.get(client, 0) >= cfg.MAX_CONNECTIONS_PER_CLIENT:
+            if per_client_limit and per_client.get(client, 0) >= cfg.MAX_CONNECTIONS_PER_CLIENT:
                 transport.abort()  # never registered with uvicorn: connection_lost below ignores it
                 return
             per_client[client] = per_client.get(client, 0) + 1
@@ -411,6 +426,8 @@ def _info(args: argparse.Namespace) -> int:
         return 2
     if resolved["cache_dir"][0] is None:
         resolved["cache_dir"] = (config.default_cache_dir(), "default")
+    if resolved["queue_size"][0] == -1 and resolved["queue_timeout"][1] == "default":
+        resolved["queue_timeout"] = (0, "default with --queue-size -1")  # as serve applies it
     settings_report = {attr: {"value": None if v is None else str(v), "from": origin}
                        for attr, (v, origin) in resolved.items()}
     for name in ("EDGESERVE_API_KEY", "EDGESERVE_TLS_CERT", "EDGESERVE_TLS_KEY", "EDGESERVE_NATIVE_DIR"):
@@ -421,6 +438,12 @@ def _info(args: argparse.Namespace) -> int:
         settings_report[name.removeprefix("EDGESERVE_").lower()] = {"value": shown,
                                                                     "from": config.source(name) or "default"}
     report["settings"] = settings_report
+    from edgeserve import keys
+
+    try:
+        report["client_keys"] = sorted(keys.load())  # names only
+    except keys.KeysError as e:
+        report["client_keys"] = {"problem": str(e)}
     try:
         if config.value("EDGESERVE_NATIVE_DIR"):
             native = NativeBuild.locate(Path(config.value("EDGESERVE_NATIVE_DIR") or ""))

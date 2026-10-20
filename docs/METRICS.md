@@ -26,10 +26,10 @@ formulas below are the definitions.
 
 | Key | Content |
 |---|---|
-| `object`, `schema_version` | `"edgeserve.record"`, `"1.0"` |
+| `object`, `schema_version` | `"edgeserve.record"`, `"1.1"` (1.1 added `client` and the status `rejected`) |
 | `custom_id`, `attempt_id` | the request ID; this attempt's own ID (`att_…`) |
-| `status`, `http_status`, `error` | `completed`, `failed` or `cancelled`; the HTTP status of the outcome (499: the client went away; for a stream that had already started, the response itself was 200 and the error went out as an SSE event; `results.jsonl` `status_code` is the same); the OpenAI-style error object (code `client_disconnected` for a 499), or null |
-| `created`, `endpoint`, `metadata`, `system_fingerprint` | arrival time (Unix seconds); `/v1/chat/completions` or `/v1/completions`; the request's `metadata`; `fp_` + 12 hex digits of the engine key |
+| `status`, `http_status`, `error` | `completed`, `failed`, `cancelled` or `rejected` (refused before it was queued); the HTTP status of the outcome (499: the client went away; for a stream that had already started, the response itself was 200 and the error went out as an SSE event; `results.jsonl` `status_code` is the same); the OpenAI-style error object (code `client_disconnected` for a 499), or null |
+| `created`, `endpoint`, `metadata`, `client`, `system_fingerprint` | arrival time (Unix seconds); `/v1/chat/completions` or `/v1/completions`; the request's `metadata`; the client: its API key's name (`default` for `EDGESERVE_API_KEY`), or its address on a server without keys; `fp_` + 12 hex digits of the engine key |
 | `model` | `name`, `path`, `engine_fingerprint`, `quantization`, `kv_cache_dtype`, `vocab_size`, `output_vocab_size`, `linear_params`, `streamed_weight_bytes`, `cost_model`, `max_input_tokens`, `kv_capacity_tokens`, `max_batch_size` |
 | `system` | the machine: board, L4T/JetPack, GPU, CUDA, TensorRT and Edge-LLM versions, power mode, clock caps, peaks, power rails |
 | `request` | the `messages` as the chat template received them (a `developer` role becomes `system`, text parts are joined) or `prompt`, and `params`: the effective `max_tokens`, `temperature`, `top_p`, `top_k`, `seed` (the server's random seed when the request sampled without one), `stop`, `stream` |
@@ -38,11 +38,17 @@ formulas below are the definitions.
 | `timestamps_ns` | Unix time in ns of `arrival`, `queued`, `scheduled`, `first_token`, `last_token`, `finished` (the events below) |
 | `metrics`, `steps` | below; `steps` is absent when no token was generated |
 
-A request refused before it is queued gets no record, so it cannot overwrite the record of an
-earlier attempt with the same ID. Admission refusals (not ready, low memory, a duplicate ID, a full
-queue, shutting down, a prompt or `max_tokens` too long for the context) are counted in
-`edgeserve_admission_rejections_total{reason}`; other refusals (401, invalid JSON or parameters, an
-unknown model) appear only in the access log. A request cut short by a worker crash is recorded as
+A request refused before it is queued gets a short record with status `rejected`: `custom_id`,
+`attempt_id`, `http_status`, `error`, `created`, `endpoint`, `metadata`, `client`, `model.name`,
+`request` and `timestamps_ns` (`arrival`, `finished`). Its `request` is the body as the server parsed it,
+without `request_id` and `metadata` (e.g. `{"messages": […], "max_tokens": 4, "n": 1, "stream": false,
+"return_record": false}`; the text of a body over 64 KiB is left out), not the `messages` and
+`params` above; it is null when the body was invalid or not read (`rate_limit_exceeded`). It is written
+only for an ID the request named, never over an earlier record or a running request's ID, and at most
+60 a minute per client; requests without a valid key are not saved. Admission refusals (not ready,
+low memory, a duplicate ID, a full queue, shutting down, a prompt or `max_tokens` too long for the
+context, a client over `--max-client-requests` or `--client-rate-limit`) are counted in
+`edgeserve_admission_rejections_total{reason}`. A request cut short by a worker crash is recorded as
 failed (`worker_restarted`) without `steps`, although a streaming client may already have received
 part of the text.
 
@@ -213,7 +219,8 @@ labelled `model_name`, so vLLM-style dashboards and NVIDIA AIPerf's server-metri
 | `edgeserve_num_requests_running`, `edgeserve_num_requests_waiting`, `edgeserve_kv_cache_usage_perc`, `edgeserve_system_memory_available_bytes`, `edgeserve_peak_flops_per_second`, `edgeserve_peak_memory_bandwidth_bytes_per_second`, `edgeserve_server_state{state}`, `edgeserve_model_info{...}` | gauge |
 
 Label values: `error_type` is the record status (`failed`, `cancelled`); `reason` is `not_ready`,
-`low_memory`, `duplicate_request_id`, `queue_full`, `shutting_down` or `context_length`; `state` is one of
+`low_memory`, `duplicate_request_id`, `queue_full`, `shutting_down`, `context_length`, `client_limit`
+(`--max-client-requests`) or `rate_limited` (`--client-rate-limit`); `state` is one of
 `starting`, `building_engine`, `loading`, `ready`, `restarting`, `draining`, `failed`, `stopped`. Every
 one of these series is exported from the start (at 0), so `rate()` and `increase()` also count the
 first event. `edgeserve_kv_cache_usage_perc` is the fraction (0–1, not a percentage) of the KV cache

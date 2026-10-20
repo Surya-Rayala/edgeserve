@@ -224,13 +224,13 @@ async def test_api_key_required_when_configured(tmp_path, tiny_model, fake_nativ
         model = r.json()["data"][0]
         assert model["id"] == "tiny_model" and model["max_batch_size"] == 1 and model["ready"] is True
         assert (await client.get("/health")).status_code == 200  # probes stay open
-        assert (await client.get("/metrics")).status_code == 200
+        assert (await client.get("/metrics")).status_code == 401  # Host "test": not this machine itself
+        assert (await client.get("/metrics", headers={"Authorization": "Bearer secret-key"})).status_code == 200
 
 
 async def test_duplicate_inflight_id_and_queue_full(tmp_path, tiny_model, fake_native, monkeypatch):
     monkeypatch.setenv("FAKE_STEP_MS", "150")
-    monkeypatch.setattr(limits, "QUEUE_SIZE", 1)
-    async with running(make_settings(tmp_path, tiny_model, fake_native)) as (client, _):
+    async with running(make_settings(tmp_path, tiny_model, fake_native, queue_size=1)) as (client, _):
         first = asyncio.create_task(client.post("/v1/chat/completions", json={"messages": MESSAGES},
                                                 headers={"X-Request-Id": "dup"}))
         await asyncio.sleep(0.2)
@@ -380,7 +380,11 @@ async def test_metadata_without_a_utf8_form_is_refused_before_any_work(tmp_path,
         await wait_for_file(tmp_path / "out" / "records" / "emoji.json")
         r = await client.get("/v1/records/emoji")
         assert r.status_code == 200 and r.json()["metadata"] == {"note": note}
-    assert not (tmp_path / "out" / "records" / "lone.json").exists()
+        # the refused request is saved too, readable, without the text that has no UTF-8 form
+        await wait_for_file(tmp_path / "out" / "records" / "lone.json")
+        r = await client.get("/v1/records/lone")
+        assert r.status_code == 200 and (r.json()["status"], r.json()["http_status"]) == ("rejected", 400)
+        assert r.json()["metadata"] is None and r.json()["error"]["param"] == "metadata"
 
 
 # ---------------------------------------------------------------------------- IDs and access

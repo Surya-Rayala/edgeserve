@@ -4,6 +4,7 @@ Everything lives under the user's home folder, so a shell and the systemd servic
 
     ~/.config/edgeserve/edgeserve.env     settings (EDGESERVE_CONFIG_DIR moves the whole folder)
     ~/.config/edgeserve/*.crt, *.key      TLS certificates made by ``edgeserve setup --network``
+    ~/.config/edgeserve/client-keys.json  the clients' API keys (``edgeserve keys``; SHA-256 hashes only)
     ~/.local/share/edgeserve/native/      the GPU runtime built by ``edgeserve setup`` (versions + ``current``)
     ~/.cache/edgeserve/engines/           TensorRT engines built from models (EDGESERVE_CACHE_DIR moves it)
     ~/.cache/edgeserve/native-build/      the runtime's build tree (safe to delete)
@@ -41,9 +42,14 @@ SETTINGS = {
     "EDGESERVE_OUTPUT_DIR": "folder for a record of every request (default: none)",
     "EDGESERVE_HOST": "address to listen on: 127.0.0.1 (default, this machine only) or 0.0.0.0 (the network)",
     "EDGESERVE_PORT": "port (default 8000)",
-    "EDGESERVE_API_KEY": "the key clients must send (Authorization: Bearer <key>); required for 0.0.0.0",
+    "EDGESERVE_API_KEY": "the key of client default (Authorization: Bearer <key>); 0.0.0.0 needs it or a key from edgeserve keys add",
     "EDGESERVE_TLS_CERT": "server certificate (PEM) for HTTPS",
     "EDGESERVE_TLS_KEY": "its private key (PEM)",
+    "EDGESERVE_QUEUE_SIZE": "requests that may wait beyond the running batch (default 16; -1: no limit at all)",
+    "EDGESERVE_QUEUE_TIMEOUT": "seconds a request may wait before it fails (default 600; 0: no limit)",
+    "EDGESERVE_REQUEST_TIMEOUT": "seconds from arrival after which a request is stopped (default 0: no limit)",
+    "EDGESERVE_MAX_CLIENT_REQUESTS": "requests one client may have waiting or running (default 0: no limit)",
+    "EDGESERVE_CLIENT_RATE_LIMIT": "requests a minute per client: that many at once, then one every 60/N s (default 0: no limit)",
     "EDGESERVE_CACHE_DIR": "where built engines are kept (default ~/.cache/edgeserve)",
     "EDGESERVE_NATIVE_DIR": "a GPU runtime build to use instead of the one edgeserve setup made",
 }

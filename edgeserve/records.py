@@ -11,7 +11,7 @@ created with mode 0700 and files with mode 0600. Writes are atomic (temporary fi
 directory, flush + fsync, os.replace) so a crash never leaves a truncated record.
 
 A record is a dict produced by edgeserve.metrics (schema "edgeserve.record" v1); the fields used
-here are: custom_id, status ("completed" | "failed" | "cancelled"), timestamps_ns.arrival,
+here are: custom_id, status ("completed" | "failed" | "cancelled" | "rejected"), timestamps_ns.arrival,
 timestamps_ns.finished, usage.prompt_tokens, usage.completion_tokens, metrics.ttft_ms,
 metrics.tpot_ms, metrics.e2e_ms, metrics.queue_ms, metrics.decode_tokens_per_s, metrics.energy_j
 and steps.itl_ms (per-token gaps; first entry null). Any of them may be missing or null.
@@ -37,7 +37,7 @@ _DIR_MODE = 0o700
 _FILE_MODE = 0o600
 _O_BINARY = getattr(os, "O_BINARY", 0)  # Windows: no newline translation
 _FSYNC_INTERVAL_S = 5.0
-_STATUSES = ("completed", "failed", "cancelled")
+_STATUSES = ("completed", "failed", "cancelled", "rejected")
 _LATENCY_KEYS = ("ttft_ms", "tpot_ms", "e2e_ms", "queue_ms", "decode_tokens_per_s")
 _PERCENTILES = (("p50", 50.0), ("p90", 90.0), ("p99", 99.0))
 
@@ -190,7 +190,7 @@ def summarize(records: Iterable[dict]) -> dict:
 
     Returns::
 
-        {"request_counts": {"total", "completed", "failed", "cancelled"},
+        {"request_counts": {"total", "completed", "failed", "cancelled", "rejected"},
          "usage": {"prompt_tokens", "completion_tokens", "total_tokens"},
          "window_s": last finished - first arrival (seconds; None if unknown),
          "busy_s": time with at least one request in progress (seconds; None if unknown): window_s without the
@@ -209,7 +209,7 @@ def summarize(records: Iterable[dict]) -> dict:
     do not inflate it. Non-numeric, boolean and non-finite values (and integers beyond the float range) are
     ignored like None.
     """
-    counts = {"total": 0, "completed": 0, "failed": 0, "cancelled": 0}
+    counts = {"total": 0, "completed": 0, "failed": 0, "cancelled": 0, "rejected": 0}
     prompt_tokens: int | float = 0
     completion_tokens: int | float = 0
     first_arrival: int | float | None = None
