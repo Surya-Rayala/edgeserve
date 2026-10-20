@@ -19,7 +19,7 @@ Run LLMs on NVIDIA Jetson and NVIDIA GPUs behind an OpenAI-compatible API, using
 [uninstall](#uninstall), [commands](#command-reference), [options and settings](#options-and-settings),
 [troubleshooting](#troubleshooting), [documentation](#documentation).
 
-In the commands below, replace each `<placeholder>` with your own value.
+In the commands below, replace each `<placeholder>`, angle brackets included, with your own value.
 
 ## Requirements
 
@@ -270,13 +270,14 @@ step 5 stop working.
 
 **On each client machine** you need the server's `edgeserve-ca.crt` and the key. Below,
 `<server-ip>` is the server's IP address (`edgeserve setup --network` prints it) and `<user>` is your
-user name on the server.
+user name on the server. The first two lines copy both from the server over SSH; you can also paste
+the key yourself, e.g. `export EDGESERVE_API_KEY=es-…`.
 
 Linux and macOS (Terminal):
 
 ```bash
 scp <user>@<server-ip>:.config/edgeserve/edgeserve-ca.crt .
-export EDGESERVE_API_KEY=<the key>
+export EDGESERVE_API_KEY=$(ssh <user>@<server-ip> "sed -n 's/^EDGESERVE_API_KEY=//p' .config/edgeserve/edgeserve.env")
 curl --cacert edgeserve-ca.crt -H "Authorization: Bearer $EDGESERVE_API_KEY" https://<server-ip>:8000/v1/models
 curl --cacert edgeserve-ca.crt https://<server-ip>:8000/v1/chat/completions \
   -H "Authorization: Bearer $EDGESERVE_API_KEY" -H "Content-Type: application/json" -H "X-Request-Id: client-001" \
@@ -287,7 +288,7 @@ Windows (PowerShell; `scp` and `curl.exe` come with Windows 10 and 11):
 
 ```powershell
 scp <user>@<server-ip>:.config/edgeserve/edgeserve-ca.crt .
-$env:EDGESERVE_API_KEY = "<the key>"
+$env:EDGESERVE_API_KEY = ssh <user>@<server-ip> "sed -n 's/^EDGESERVE_API_KEY=//p' .config/edgeserve/edgeserve.env"
 curl.exe --ssl-no-revoke --cacert edgeserve-ca.crt -H "Authorization: Bearer $env:EDGESERVE_API_KEY" https://<server-ip>:8000/v1/models
 Set-Content -Encoding ascii request.json '{"messages": [{"role": "user", "content": "What is a GPU? Answer in one sentence."}], "max_tokens": 100}'
 curl.exe --ssl-no-revoke --cacert edgeserve-ca.crt https://<server-ip>:8000/v1/chat/completions `
