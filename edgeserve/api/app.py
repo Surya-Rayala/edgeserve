@@ -382,6 +382,8 @@ def create_app(service: Service) -> FastAPI:
                 service.commit(job, service.make_record(job, status="cancelled", http_status=499))
                 return Response(status_code=499)
             error = from_worker(payload[0], retry_after=scheduler.retry_after_s())
+            if job.timed_out and job.t_dispatch_ns is not None:  # stopped while running in a batch
+                error.headers.update(_NO_RETRY)  # it would only run into the limit again
             service.commit(job, service.make_record(job, status="failed", http_status=error.status,
                                                     error=error.body()["error"]))
             raise error

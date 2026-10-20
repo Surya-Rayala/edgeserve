@@ -20,10 +20,14 @@ an SSH tunnel: `ssh -L 8000:127.0.0.1:8000 <user>@<server-ip>`, then `https://12
 | GET | `/docs`, `/openapi.json` | the interactive API page and its schema | from other machines |
 
 "API key: yes" applies when the server has a key: `EDGESERVE_API_KEY` (client `default`), or keys
-made with `edgeserve keys add <name>`, one per client. A server listening on the network always asks
-for one. It is sent as `Authorization: Bearer <key>`; the client it belongs to is saved in each
-record, and the per-client limits count each key on its own. "From other machines": with keys, these
-need a key too, except for requests from the server itself. The GET endpoints also answer HEAD.
+made with `edgeserve keys add <name>`, one per client (edgeserve keeps only their SHA-256 hashes, in
+`~/.config/edgeserve/client-keys.json`). A server listening on the network always asks for one, and
+so does any server once a client key exists, also for requests from the server itself. It is sent as
+`Authorization: Bearer <key>`; the client it belongs to is saved in each record, and the per-client
+limits count each key on its own. "From other machines": with keys, these need a key too, except for
+requests from the server itself to `127.0.0.1` or `localhost`. A reverse proxy on the server must send `X-Forwarded-For`,
+`X-Real-IP` or `Forwarded`; otherwise every request it passes on counts as one from the server. The
+GET endpoints also answer HEAD.
 
 `GET /v1/models` returns the served model with its limits (they appear once the engine is built;
 until then the entry has only the name and `ready: false`):

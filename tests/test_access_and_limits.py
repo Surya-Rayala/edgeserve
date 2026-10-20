@@ -546,6 +546,7 @@ async def test_request_timeout_stops_every_request_of_a_batch_at_once(tmp_path, 
         scheduler.wake()
         r, s = await plain, await streamed
         assert r.status_code == 504 and "time_limit_exceeded" in s.text and s.text.endswith("data: [DONE]\n\n")
+        assert r.headers.get("x-should-retry") == "false"  # stopped while running: not to be sent again
         await eventually(lambda: not scheduler._per_client)
     for custom_id in ("t0", "t1"):
         record = await read_record(tmp_path, custom_id)

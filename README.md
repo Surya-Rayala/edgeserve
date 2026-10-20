@@ -147,19 +147,49 @@ and caches it; later starts take seconds. The server listens on `http://127.0.0.
 only this machine can reach. Stop it with Ctrl-C. To test it, run `edgeserve check` in a second
 terminal.
 
-The options you will use most:
+Its options:
 
 | Option | Default | What it does |
 |---|---|---|
 | `--model DIR` | none | the model folder; after `edgeserve setup --model <model-dir>`, plain `edgeserve serve` is enough |
 | `--output-dir DIR` | none | save every request, answered or not, as JSON ([saved requests](#saved-requests)) |
-| `--max-batch-size N` | 1 | requests generated together ([many requests at once](#many-requests-at-once)) |
-| `--max-input-len N` | 3072 | the longest prompt, in tokens |
-| `--max-new-tokens N` | the model's default, else 512 | the answer length when a request does not set `max_tokens` |
 | `--host ADDRESS`, `--port N` | 127.0.0.1, 8000 | where the server listens; [step 6](#6-access-from-other-machines) opens it to the network |
+| `--max-batch-size N` | 1 | how many requests are generated together ([many requests at once](#many-requests-at-once)) |
+| `--max-input-len N` | 3072 | the longest prompt, in tokens; a longer one is refused |
+| `--max-new-tokens N` | the model's default, else 512 | the answer length when a request does not set `max_tokens` |
+| `--cache-dir DIR` | `~/.cache/edgeserve` | where the converted engines are kept |
+| `--queue-size N` | 16 | how many requests may wait for their turn; more are refused (503). `-1`: no limit |
+| `--queue-timeout SECONDS` | 600 | a request that has waited this long fails (503). `0`: no limit |
+| `--request-timeout SECONDS` | no limit | a request not finished this long after it arrived is stopped (504) |
+| `--max-client-requests N` | no limit | how many requests one client may have waiting or running; more are refused (429) |
+| `--client-rate-limit N` | no limit | requests a minute per client: N at once, then one every 60/N seconds; more are refused (429) |
 
-The queue and per-client limits are in [many requests at once](#many-requests-at-once); every option,
-and how to set it permanently, in [options and settings](#options-and-settings).
+To set an option permanently, see [options and settings](#options-and-settings).
+
+### Many requests at once
+
+Requests wait in a queue, and the oldest runs first. With `--max-batch-size N`, up to N waiting
+requests of the same kind (chat or completion), with the same `temperature`, `top_p`, `top_k` and
+`max_tokens`, are generated together. When it starts, the server reserves memory for N requests of
+up to `--max-input-len` + `--max-new-tokens` tokens each, so lower those two to fit a larger N.
+Changing any of the three builds a new engine (a few minutes; it is cached too). For example, to
+batch up to 3 requests and keep every request until its turn:
+
+```bash
+edgeserve serve --model <model-dir> --max-batch-size 3 --max-input-len 1024 --max-new-tokens 256 --queue-size -1
+```
+
+- **A client** is one API key ([a key for each client](#a-key-for-each-client)), or one address on a
+  server without keys.
+- **`--queue-size -1`** keeps every request: there is no wait limit unless you also give
+  `--queue-timeout`, and no connection limit. Otherwise one address can open at most 32
+  connections, and all clients together 128.
+- **A refused request** (429 or 503) gets a `Retry-After` header with the seconds to wait. The OpenAI
+  SDK and `edgeserve batch` wait and retry by themselves; with curl, retry yourself. A request
+  stopped by `--request-timeout` while running is not retried, as it would run out of time again.
+- **A waiting client** has its own timeout: after 600 s without an answer, the OpenAI SDK drops the
+  request and sends it again at the back of the queue, twice at most; `OpenAI(..., timeout=3600)`
+  waits longer.
 
 ## 5. Send requests
 
@@ -327,72 +357,38 @@ key and the CA file.
 - **Firewall:** allow only your own network to reach port 8000. `edgeserve setup --network` prints
   the `ufw` commands for your network.
 - **This machine only again:** set `EDGESERVE_HOST=127.0.0.1` in the settings file.
+- **`/metrics` and `/docs`** need the key too, except when opened at `127.0.0.1` on the server
+  itself; `/health` stays open.
 
 ### A key for each client
 
-Give each person or machine its own key, so that you can revoke one without changing the others:
+Rather than sharing the key from `edgeserve setup --network` (client `default`), you can give each
+person or machine its own. You can then remove one without changing the others, and each saved
+request shows which client sent it. On the server:
 
 ```bash
-edgeserve keys add <name>       # makes a key for client <name> and shows it once
-edgeserve keys list             # the clients that have keys (never the keys)
+edgeserve keys add <name>       # make a key for client <name>; it is shown only now
+edgeserve keys list             # the clients that have a key
 edgeserve keys remove <name>    # that key stops working at once
 ```
 
-Give each client the key that `edgeserve keys add` printed, instead of the one step 6 copies. To move
-it without copying it by hand, save it on the server and fetch it from the client device over SSH
-(which deletes the file again):
+The client uses its own key in place of the `default` key, and still needs `edgeserve-ca.crt`. To
+skip copying the key by hand, make it straight into a file (instead of the plain `keys add` above),
+then fetch it on the client over SSH, which also deletes the file:
 
 ```bash
-edgeserve keys add <name> | grep -o 'es-[A-Za-z0-9_-]*' > ~/<name>.key && chmod 600 ~/<name>.key    # on the server
-export EDGESERVE_API_KEY=$(ssh <user>@<server-ip> "cat <name>.key && rm <name>.key")              # on the client
+edgeserve keys add <name> | awk '$1 ~ /^es-/ {print $1}' > ~/<name>.key && chmod 600 ~/<name>.key   # on the server
+export EDGESERVE_API_KEY=$(ssh <user>@<server-ip> "cat <name>.key && rm <name>.key")                # on the client
 ```
 
-On Windows (PowerShell) the client line is
-`$env:EDGESERVE_API_KEY = ssh <user>@<server-ip> "cat <name>.key && rm <name>.key"`. The client also
-needs `edgeserve-ca.crt`, copied as in step 6.
+On Windows (PowerShell), the client line is
+`$env:EDGESERVE_API_KEY = ssh <user>@<server-ip> "cat <name>.key && rm <name>.key"`.
 
-Keys work at once, also on a running server. Once one exists, every `/v1/` request needs a key, from
-the server itself too (`edgeserve check` and `edgeserve batch` send `EDGESERVE_API_KEY`). edgeserve
-keeps only a hash of each key, in `~/.config/edgeserve/client-keys.json`; the key of
-`edgeserve setup --network` keeps working as client `default`.
-
-- **Each client on its own:** saved requests show their client, a client key reads only its own
-  records (the `default` key reads all), a request ID belongs to the client that used it first, and the
-  per-client limits below count each key on its own.
-- **Pages for the operator:** `/metrics` and the API page `/docs` need a key as well, except from the
-  server itself (a reverse proxy on the server must send `X-Forwarded-For`); `/health` and
-  `/health/ready` stay open.
-
-## Many requests at once
-
-Requests wait in a queue and run in the order they arrived. With `--max-batch-size N`, up to N waiting
-requests with the same settings (`temperature`, `top_p`, `top_k` and `max_tokens`) run together. Each
-batch slot reserves its own memory when the server starts, so lower `--max-input-len` and
-`--max-new-tokens` to make room for more. Measured on an 8 GB Orin Nano with a pruned 6B INT4 model,
-20 requests sent at once:
-
-| Server | Answered | All done after | Total speed |
-|---|---|---|---|
-| `edgeserve serve` (batch size 1) | 17 of 20 | 51 s | 24 tokens/s |
-| `edgeserve serve --max-batch-size 3 --max-input-len 1024 --max-new-tokens 256` | 19 of 20 | 29 s | 47 tokens/s |
-
-The queue and the limits (a client is one API key, or one address on a server without keys):
-
-| Option | Default | What happens |
-|---|---|---|
-| `--queue-size N` | 16 | beyond N waiting requests, new ones are refused: 503 `server_is_overloaded`. `-1`: every request waits for its turn (no wait limit unless `--queue-timeout` is given, and no connection limit) |
-| `--queue-timeout SECONDS` | 600 | a request that has waited that long fails: 503 `queue_timeout`. `0`: no limit |
-| `--request-timeout SECONDS` | 0 (no limit) | a request not finished that long after it arrived is stopped: 504 `time_limit_exceeded` (a stream gets it as its last event) |
-| `--max-client-requests N` | 0 (no limit) | a client with N requests waiting or running is refused more: 429 `too_many_requests` |
-| `--client-rate-limit N` | 0 (no limit) | N requests a minute per client: N at once, then one every 60/N seconds; more are refused: 429 `rate_limit_exceeded` |
-
-Every 429 and 503 carries a `Retry-After` header, in seconds: when the client may send again (for the
-rate limit), otherwise the expected rest of the running batch, from the measured batch times (1 to
-60 s). The OpenAI SDK and `edgeserve batch` wait and retry these by themselves; with curl, retry
-yourself. A 504 is marked not to be sent again: it would run out of time again. Without
-`--queue-size -1`, one address can open at most 32 connections and all clients together 128. A
-waiting client still gives up when its own timeout runs out (the OpenAI SDK after 600 s:
-`OpenAI(..., timeout=3600)` waits longer), and its request then leaves the queue.
+- Adding or removing a key works at once, also on a running server.
+- A client reads only its own saved requests; the `default` key reads all of them.
+- `--max-client-requests` and `--client-rate-limit` count each key separately.
+- edgeserve stores only a hash of each key, so a lost key cannot be shown again: remove it and add a
+  new one.
 
 ## Saved requests
 
@@ -586,7 +582,7 @@ settings folder), `EDGESERVE_API_KEY` on a client (the key `check` and `batch` s
 | HTTP 401 | send the key: `Authorization: Bearer <key>`; a key removed with `edgeserve keys remove` no longer works |
 | HTTP 429 `too_many_requests` or `rate_limit_exceeded` | the client is over `--max-client-requests` or `--client-rate-limit`: retry after the `Retry-After` seconds |
 | HTTP 503 `server_is_overloaded` or `queue_timeout` | the queue is full or the wait too long: retry after `Retry-After`; raise `--queue-size` or `--queue-timeout`, or batch more with `--max-batch-size` |
-| HTTP 504 `time_limit_exceeded` | the request took longer than `--request-timeout` (it is not sent again automatically): raise the limit, or ask for fewer `max_tokens` |
+| HTTP 504 `time_limit_exceeded` | the request took longer than `--request-timeout`: raise the limit, or ask for fewer `max_tokens` (a request stopped while running is not sent again automatically) |
 | certificate errors | give the client `edgeserve-ca.crt`; use a host name or address the certificate lists, or run `edgeserve setup --network` again after an address change |
 | `<host>.local` does not connect | use the IP address; mDNS can announce a Docker bridge address (fix: `deny-interfaces=docker0` in `/etc/avahi/avahi-daemon.conf`) |
 | other machines cannot connect | run `edgeserve setup --network` and restart; check the firewall (`sudo ufw status`) |

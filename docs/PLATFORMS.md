@@ -122,6 +122,18 @@ slower tokens, and a lower MBU. For benchmarking, `sudo jetson_clocks` pins the 
 maximum, at the cost of higher idle power. Run `sudo jetson_clocks --store` once before it;
 `sudo jetson_clocks --restore` (or a reboot) undoes it.
 
+Many requests at once, with the same model and a VS Code remote session connected (a batch of 4 did
+not fit while it was connected), 20 chat requests sent at the same moment:
+
+| Server | Answered | All done after | Total speed |
+|---|---|---|---|
+| `edgeserve serve` (batch size 1) | 17 of 20 | 51 s | 24 tokens/s |
+| `edgeserve serve --max-batch-size 3 --max-input-len 1024 --max-new-tokens 256` | 19 of 20 | 29 s | 47 tokens/s |
+| the same, plus `--queue-size -1` | 20 of 20 | 30 s | 48 tokens/s |
+
+The others were refused with 503 because the queue was full: beyond the running batch, the default
+`--queue-size` is 16.
+
 ## Checking a platform
 
 `edgeserve setup` runs `attention-check` after every build. It runs the two attention kernels the
