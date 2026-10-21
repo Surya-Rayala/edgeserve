@@ -560,8 +560,8 @@ def _explain_build_failure(returncode: int, tail: str, model: ModelInfo, profile
     if oom:
         free = ("stop the desktop: sudo systemctl isolate multi-user.target; close IDE servers" if integrated
                 else "close other programs")
-        advice = (f"\nThe build ran out of memory. Free memory ({free}), add swap for the build, or lower "
-                  f"--max-input-len (now {profile.max_input_len}).")
+        advice = (f"\nThe build ran out of memory. Free memory ({free}), add a swap file for the build (README, "
+                  f"'When the engine build runs out of memory'), or lower --max-input-len (now {profile.max_input_len}).")
     return f"TensorRT engine build for {model.name} failed (exit code {returncode}).{advice}\nllm_build log:\n{tail}"
 
 

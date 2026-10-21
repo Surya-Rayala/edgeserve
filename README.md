@@ -191,6 +191,27 @@ edgeserve serve --model <model-dir> --max-batch-size 3 --max-input-len 1024 --ma
   request and sends it again at the back of the queue, twice at most; `OpenAI(..., timeout=3600)`
   waits longer.
 
+### When the engine build runs out of memory
+
+Building an engine needs more memory than serving the model: for a few minutes the builder holds the
+model's weights and its own working copies. So a model that fits for serving can still fail to
+build, and edgeserve reports that the build "ran out of memory". This is most likely with a large
+vocabulary or other FP16 layers kept inside the engine. On a Jetson the CPU and GPU share the
+memory, and its built-in swap (zram) is compressed memory, so it adds little room.
+
+A swap file on the disk lets the build move memory it is not using to the disk and finish. Put it
+on an SSD or NVMe (swap wears out SD cards):
+
+```bash
+sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon --priority 1 /swapfile   # zram, if any, stays first
+swapon --show
+```
+
+Then start `edgeserve serve` again. Serving is unaffected: GPU memory is never moved to disk, and
+edgeserve's memory checks count only free memory, not swap. The engine is cached, so the swap is
+needed only while it builds; remove it with `sudo swapoff /swapfile && sudo rm /swapfile`.
+
 ## 5. Send requests
 
 With curl:
@@ -574,7 +595,8 @@ settings folder), `EDGESERVE_API_KEY` on a client (the key `check` and `batch` s
 | `edgeserve setup` lists missing packages | install them with the `apt` line it prints, then run it again |
 | "the GPU runtime is not built yet" or "… from other sources" | run `edgeserve setup` |
 | `/health/ready` says `building_engine` | normal on the first start of a model or new limits |
-| "not enough memory", or the engine build "ran out of memory" | [free memory](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/PLATFORMS.md#free-memory-on-a-jetson) on a Jetson; use an INT4 or a smaller model, lower `--max-input-len`, keep `--max-batch-size 1` |
+| "not enough memory" | [free memory](https://github.com/Surya-Rayala/edgeserve/blob/main/docs/PLATFORMS.md#free-memory-on-a-jetson) on a Jetson; use an INT4 or a smaller model, lower `--max-input-len`, keep `--max-batch-size 1` |
+| the engine build "ran out of memory", although the model fits for serving | add a swap file for the build: [when the engine build runs out of memory](#when-the-engine-build-runs-out-of-memory) |
 | "exported with TensorRT Edge-LLM x.y" | export the model again with `edgeserve export` |
 | "is a Hugging Face checkpoint, not an exported model" | export it first: `edgeserve export <checkpoint-dir> <model-dir>`, then serve `<model-dir>` |
 | "is a GGUF file", "holds GGUF files" or "holds an ONNX model made by another tool" | export the Hugging Face checkpoint the model was made from |
